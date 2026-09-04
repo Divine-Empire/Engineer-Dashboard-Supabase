@@ -72,7 +72,6 @@ function SearchableSrnDropdown({ value, onChange, options, placeholder }) {
 export default function MaterialTesting() {
   const [activeTab, setActiveTab] = useState('pending');
   const [sheetRecords, setSheetRecords] = useState([]);
-  const [partialQCRecords, setPartialQCRecords] = useState([]);
   const [fetchLoading, setFetchLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedSale, setSelectedSale] = useState(null);
@@ -83,24 +82,31 @@ export default function MaterialTesting() {
   const [selectedHistoryRecord, setSelectedHistoryRecord] = useState(null);
 
   // Real schema (verified live against the PFMS production project,
-  // 2026-09-02 — see [[material-testing-migration]] memory):
+  // 2026-09-04 — see [[material-testing-migration]] memory):
   //   - pfms_dropdown is a WIDE table (named columns, not category/value) —
   //     "Checked By" / "QC-Checklist" / "Reject Type (QC)", values scattered
   //     across many rows.
-  //   - pfms_material-testing uses camelCase columns; checklist/serialNumbers
-  //     /images are real Postgres arrays (text[]), not comma-joined strings.
-  //     `id` has no DB default — the client must generate one.
-  //   - pfms_view-receiving_accounts (a big multi-table join) exposes
-  //     `indent_no` (not indent_number). Its planned_stage11/actual_stage11
-  //     columns come from pfms_material-received.plannedMaterialTesting and
-  //     the LATEST pfms_material-testing row's timestamp — NOT stage8 (that
-  //     pair is Tally Entry, a different stage). actual_stage11 flips the
-  //     moment ANY testing row exists for a lift, even a partial one, so
-  //     completion here is computed from cumulative qty instead
-  //     (pendingQty <= 0), matching the "partial QC across multiple
-  //     submissions" workflow.
-  //   - Damage qty/reason/image live on pfms_material-received (camelCase:
-  //     damagedQty/damageReason/damageImage), not on the view.
+  //   - pfms_material-testing is ONE row per lift, NOT a log. It's created
+  //     upstream by Purchase-FMS-Supabase's own material-received stage,
+  //     ONLY when that lift's qcRequirement = 'yes' (app/api/material-received
+  //     /route.ts) — most received lifts never get a row here at all. Every
+  //     QC submission UPDATEs that same row in place (pendingQty/approvedQty
+  //     /rejectedQty accumulate, checklist/serialNumbers/images arrays
+  //     append) — see app/api/material-testing/route.ts POST. This page must
+  //     mirror that: never insert a second row for a lift that already has
+  //     one, or Purchase-FMS-Supabase's own `.eq('liftNo',...).maybeSingle()`
+  //     fetch breaks.
+  //   - This row's OWN pendingQty/approvedQty/rejectedQty are the source of
+  //     truth for Pending vs History — NOT pfms_view-receiving_accounts'
+  //     planned_stage11 (that's set for every received lift, whether or not
+  //     QC is required, which is why querying it here previously showed ~500
+  //     "pending" instead of the ~32 lifts actually awaiting QC).
+  //   - checklist/serialNumbers/images are real Postgres arrays (text[]).
+  //   - Cancelled indents (pfms_order-cancellation) must be excluded from
+  //     Pending, same as the Purchase system's own route.
+  //   - Damage qty/reason/image and receivedQty live on pfms_material-received
+  //     (camelCase: damagedQty/damageReason/damageImage/receivedQty), joined
+  //     in via pfms_lift -> pfms_material-received.
   //   - pfms_serial-number's columns are `liftNo`/`serialNo` (camelCase).
   const loadSales = async () => {
     setFetchLoading(true);
@@ -115,76 +121,102 @@ export default function MaterialTesting() {
         setRejectTypeList([...new Set(dropRows.map((r) => r['Reject Type (QC)']).filter(Boolean))]);
       }
 
-      const { data: qcRows, error: qcError } = await pfmsSupabase
+      // Same nested embed Purchase-FMS-Supabase's own GET route uses.
+      const { data: testings, error: testingError } = await pfmsSupabase
         .from('pfms_material-testing')
-        .select('*')
-        .order('createdAt', { ascending: false });
-      if (qcError) throw qcError;
+        .select(`
+          *,
+          lift:pfms_lift!inner (
+            liftNo,
+            indent:pfms_indent-generation!inner (
+              indentNo,
+              itemName,
+              category,
+              warehouseLocation,
+              negotiation:pfms_negotiation (
+                selectedVendorName
+              ),
+              poEntry:"pfms_po-entry" (
+                poNumber,
+                basicValue,
+                totalWithTax
+              )
+            ),
+            materialReceived:"pfms_material-received" (
+              invoiceNumber,
+              invoiceDate,
+              receivedQty,
+              damagedQty,
+              damageReason,
+              damageImage,
+              plannedMaterialTesting,
+              timestamp
+            )
+          )
+        `);
+      if (testingError) throw testingError;
 
-      const approvedMap = new Map();
-      const rejectedMap = new Map();
-      if (qcRows) {
-        setPartialQCRecords(qcRows);
-        qcRows.forEach((r) => {
-          const liftNo = String(r.liftNo || '').trim().toLowerCase();
-          if (!liftNo) return;
-          approvedMap.set(liftNo, (approvedMap.get(liftNo) || 0) + (parseFloat(r.approvedQty || 0)));
-          rejectedMap.set(liftNo, (rejectedMap.get(liftNo) || 0) + (parseFloat(r.rejectedQty || 0)));
-        });
-      }
+      const { data: cancelledList, error: cancelledError } = await pfmsSupabase
+        .from('pfms_order-cancellation')
+        .select('indentNo');
+      if (cancelledError) throw cancelledError;
+      const cancelledNos = new Set((cancelledList || []).map((c) => c.indentNo));
 
-      const { data: receivedRows, error: receivedError } = await pfmsSupabase
-        .from('pfms_material-received')
-        .select('"liftNo","damagedQty","damageReason","damageImage"');
-      if (receivedError) throw receivedError;
+      const rows = (testings || []).map((testing) => {
+        const lift = testing.lift || {};
+        const indent = lift.indent || {};
+        const negotiation = Array.isArray(indent.negotiation) ? (indent.negotiation[0] || {}) : (indent.negotiation || {});
+        const poEntry = Array.isArray(indent.poEntry) ? (indent.poEntry[0] || {}) : (indent.poEntry || {});
+        const matRecd = Array.isArray(lift.materialReceived) ? (lift.materialReceived[0] || {}) : (lift.materialReceived || {});
 
-      const receivedByLift = new Map(
-        (receivedRows || []).map((r) => [String(r.liftNo || '').trim().toLowerCase(), r])
-      );
+        const receivedQty = parseFloat(matRecd.receivedQty || 0);
+        const pendingQty = testing.pendingQty !== null && testing.pendingQty !== undefined
+          ? testing.pendingQty
+          : receivedQty;
 
-      const { data: receivingRows, error: receivingError } = await pfmsSupabase
-        .from('pfms_view-receiving_accounts')
-        .select('indent_no, lift_no, item_name, vendor_name, po_number, invoice_number, received_qty, planned_stage11');
-      if (receivingError) throw receivingError;
+        const checklistArr = Array.isArray(testing.checklist) ? testing.checklist : [];
+        const serialArr = Array.isArray(testing.serialNumbers) ? testing.serialNumbers : [];
+        const imageArr = Array.isArray(testing.images) ? testing.images : [];
 
-      if (receivingRows) {
-        const rows = receivingRows
-          .filter((row) => row.indent_no && String(row.indent_no).trim() !== '')
-          .map((row) => {
-            const liftNo = String(row.lift_no || '').trim().toLowerCase();
-            const receivedQty = parseFloat(row.received_qty || 0);
-            const totalApproved = approvedMap.get(liftNo) || 0;
-            const totalRejected = rejectedMap.get(liftNo) || 0;
-            const pendingQty = Math.max(0, receivedQty - (totalApproved + totalRejected));
-            const received = receivedByLift.get(liftNo);
-            let status = 'not_ready';
-            if (row.planned_stage11) {
-              status = pendingQty > 0 ? 'pending' : 'completed';
-            }
-            return {
-              id: `${row.indent_no}_${row.lift_no || ''}`,
-              liftNo: row.lift_no || '',
-              status,
-              data: {
-                indentNumber: String(row.indent_no || '').trim(),
-                liftNo: String(row.lift_no || ''),
-                vendorName: String(row.vendor_name || ''),
-                poNumber: String(row.po_number || ''),
-                itemName: String(row.item_name || ''),
-                invoiceNumber: String(row.invoice_number || '-'),
-                receivedQty,
-                plan7: row.planned_stage11 || '',
-                totalApproved,
-                totalRejected,
-                pendingQty,
-                damageQty: received?.damagedQty || '0',
-                damageReason: received?.damageReason || '-',
-                damageImage: received?.damageImage || '',
-              },
-            };
-          });
-        setSheetRecords(rows);
-      }
+        return {
+          id: testing.id,
+          liftNo: lift.liftNo || '',
+          indentNumber: indent.indentNo || '',
+          status: pendingQty > 0 ? 'pending' : 'completed',
+          data: {
+            indentNumber: indent.indentNo || '',
+            liftNo: lift.liftNo || '',
+            vendorName: negotiation.selectedVendorName || '-',
+            poNumber: poEntry.poNumber || '-',
+            itemName: indent.itemName || '-',
+            invoiceNumber: matRecd.invoiceNumber || '-',
+            receivedQty,
+            plan7: matRecd.plannedMaterialTesting || '',
+            qcDate: testing.qcDate || testing.timestamp || '',
+            qcBy: testing.qcBy || '-',
+            approvedQty: testing.approvedQty || 0,
+            rejectedQty: testing.rejectedQty || 0,
+            totalApproved: testing.approvedQty || 0,
+            totalRejected: testing.rejectedQty || 0,
+            pendingQty,
+            damageQty: matRecd.damagedQty || '0',
+            damageReason: matRecd.damageReason || '-',
+            damageImage: matRecd.damageImage || '',
+            workingCondition: testing.workingCondition || '-',
+            checklist: checklistArr.length > 0 ? checklistArr.join(', ') : '-',
+            serialNo: serialArr.length > 0 ? serialArr.join(', ') : '-',
+            image: imageArr.length > 0 ? imageArr.join(' , ') : '-',
+            rejectType: testing.rejectType || '-',
+            partName: testing.partName || '-',
+            remarks: testing.remarks || '-',
+          },
+        };
+      });
+
+      // Exclude cancelled indents from Pending, same as the Purchase system.
+      const filteredRows = rows.filter((row) => row.status !== 'pending' || !cancelledNos.has(row.indentNumber));
+
+      setSheetRecords(filteredRows);
     } catch (error) {
       console.error('Error loading Material Testing data:', error);
       toast.error('Failed to load live data');
@@ -218,56 +250,19 @@ export default function MaterialTesting() {
 
   const history = useMemo(() => {
     const searchLower = searchTerm.toLowerCase();
-    return partialQCRecords
-      .filter((pRow) => pRow.liftNo && String(pRow.liftNo).trim() !== '')
-      .map((pRow, idx) => {
-        const liftNo = String(pRow.liftNo || '').trim().toLowerCase();
-        const parentRecord = sheetRecords.find((r) => String(r.data.liftNo || '').trim().toLowerCase() === liftNo);
-        const parentData = parentRecord?.data ?? {};
-        const parentStatus = parentRecord?.status ?? 'not_ready';
-        const checklistArr = Array.isArray(pRow.checklist) ? pRow.checklist : [];
-        const serialArr = Array.isArray(pRow.serialNumbers) ? pRow.serialNumbers : [];
-        const imageArr = Array.isArray(pRow.images) ? pRow.images : [];
-        return {
-          id: `partial-${pRow.id}-${idx}`,
-          parentStatus,
-          data: {
-            indentNumber: parentData.indentNumber || '-',
-            vendorName: parentData.vendorName || '-',
-            invoiceNumber: parentData.invoiceNumber || '-',
-            itemName: parentData.itemName || '-',
-            plan7: parentData.plan7 || '-',
-            actual7: pRow.createdAt || '-',
-            qcDate: pRow.qcDate || '-',
-            qcBy: pRow.qcBy || '-',
-            approvedQty: pRow.approvedQty || '0',
-            rejectedQty: pRow.rejectedQty || '0',
-            workingCondition: pRow.workingCondition || '-',
-            remarks: pRow.remarks || '-',
-            damageQty: parentData.damageQty || '-',
-            damageReason: parentData.damageReason || '-',
-            damageImage: parentData.damageImage || '',
-            liftNo: pRow.liftNo || '-',
-            checklist: checklistArr.length > 0 ? checklistArr.join(', ') : '-',
-            serialNo: serialArr.length > 0 ? serialArr.join(', ') : '-',
-            image: imageArr.length > 0 ? imageArr.join(' , ') : '-',
-            rejectType: pRow.rejectType || '-',
-            partName: pRow.partName || '-',
-          },
-        };
-      })
-      .filter((rec) => {
-        if (rec.parentStatus !== 'completed') return false;
+    return sheetRecords
+      .filter((r) => r.status === 'completed')
+      .filter((r) => {
         if (!searchLower) return true;
         return (
-          rec.data.indentNumber?.toLowerCase().includes(searchLower) ||
-          rec.data.liftNo?.toLowerCase().includes(searchLower) ||
-          rec.data.vendorName?.toLowerCase().includes(searchLower) ||
-          rec.data.itemName?.toLowerCase().includes(searchLower)
+          r.data.indentNumber?.toLowerCase().includes(searchLower) ||
+          r.data.liftNo?.toLowerCase().includes(searchLower) ||
+          r.data.vendorName?.toLowerCase().includes(searchLower) ||
+          r.data.itemName?.toLowerCase().includes(searchLower)
         );
       })
       .reverse();
-  }, [partialQCRecords, sheetRecords, searchTerm]);
+  }, [sheetRecords, searchTerm]);
 
   const activeRecords = activeTab === 'pending' ? pending : history;
 
@@ -510,31 +505,52 @@ function QCFormModal({ isOpen, onClose, record, onSave, qcEngineerList, checklis
         imageUrlsArr = srnData.map((d) => d.image).filter(Boolean);
       }
 
-      // pfms_material-testing.id has no DB default — this app has to
-      // generate one itself.
-      const newId = (crypto.randomUUID && crypto.randomUUID()) || `mt_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      // pfms_material-testing is ONE row per lift, created upstream by
+      // Purchase-FMS-Supabase's material-received stage — UPDATE it in
+      // place (never insert a second row for the same lift, see
+      // loadSales() above / app/api/material-testing/route.ts POST).
+      const { data: currentTesting, error: fetchError } = await pfmsSupabase
+        .from('pfms_material-testing')
+        .select('*')
+        .eq('liftNo', record.data.liftNo)
+        .maybeSingle();
+      if (fetchError) throw fetchError;
+      if (!currentTesting) throw new Error(`Testing record not found for lift ${record.data.liftNo}`);
 
-      const { error: insertError } = await pfmsSupabase.from('pfms_material-testing').insert({
-        id: newId,
-        liftNo: record.data.liftNo || '',
-        qcDate,
-        workingCondition,
-        qcBy: qcBy || null,
-        approvedQty: isPassed ? (parseFloat(approvedQty) || 0) : 0,
-        checklist: isPassed ? checklistSelected : [],
-        serialNumbers: serialNosArr,
-        images: imageUrlsArr,
-        rejectType: workingCondition === 'Rejected' ? rejectType : null,
-        partName: workingCondition === 'Rejected' ? partName : null,
-        rejectedQty: workingCondition === 'Rejected' ? (parseFloat(rejectQty) || 0) : 0,
-        remarks: remarks || null,
-      });
-      if (insertError) throw insertError;
-
+      const oldApproved = currentTesting.approvedQty || 0;
+      const oldRejected = currentTesting.rejectedQty || 0;
+      const newApproved = oldApproved + (isPassed ? (parseFloat(approvedQty) || 0) : 0);
+      const newRejected = oldRejected + (workingCondition === 'Rejected' ? (parseFloat(rejectQty) || 0) : 0);
       const receivedQty = parseFloat(record.data.receivedQty || 0);
-      const currentResolved = (record.data.totalApproved || 0) + (record.data.totalRejected || 0);
-      const changeQty = isPassed ? parseFloat(approvedQty || 0) : parseFloat(rejectQty || 0);
-      if (currentResolved + changeQty >= receivedQty) {
+      const newPending = Math.max(0, receivedQty - (newApproved + newRejected));
+
+      const newChecklist = Array.from(new Set([...(currentTesting.checklist || []), ...(isPassed ? checklistSelected : [])]));
+      const newSerialNumbers = [...(currentTesting.serialNumbers || []), ...serialNosArr];
+      const newImages = [...(currentTesting.images || []), ...imageUrlsArr];
+      const now = new Date().toISOString();
+
+      const { error: updateError } = await pfmsSupabase
+        .from('pfms_material-testing')
+        .update({
+          timestamp: now,
+          qcBy: qcBy || currentTesting.qcBy,
+          qcDate: qcDate || currentTesting.qcDate,
+          workingCondition: workingCondition || currentTesting.workingCondition,
+          remarks: remarks || currentTesting.remarks,
+          pendingQty: newPending,
+          approvedQty: newApproved,
+          rejectedQty: newRejected,
+          checklist: newChecklist,
+          serialNumbers: newSerialNumbers,
+          images: newImages,
+          rejectType: workingCondition === 'Rejected' ? (rejectType || currentTesting.rejectType) : currentTesting.rejectType,
+          partName: workingCondition === 'Rejected' ? (partName || currentTesting.partName) : currentTesting.partName,
+          updatedAt: now,
+        })
+        .eq('liftNo', record.data.liftNo);
+      if (updateError) throw updateError;
+
+      if (newPending <= 0) {
         toast.success('QC Inspection Complete — all quantity resolved!');
       } else {
         toast.success('QC Entry saved successfully.');
