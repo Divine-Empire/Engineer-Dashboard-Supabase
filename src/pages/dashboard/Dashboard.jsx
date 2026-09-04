@@ -19,6 +19,8 @@ import VisitCalendarModal from './VisitCalendarModal';
 import { useAuthStore } from '../../store/authStore';
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip } from "recharts";
 import { ltoSupabase } from '../../lib/supabase/ltoClient';
+import { supabase } from '../../lib/supabase/client';
+import { computeStagePlanned } from '../../lib/supabase/stagePlanning';
 
 //------------------------------------------------
 //*ADDITIONAL IMPORTS NEEDED FOR NEW ENQUIRY MODAL
@@ -213,187 +215,176 @@ export default function Dashboard() {
   const fetchDashboardStats = async () => {
     setStatsLoading(true);
     try {
-      const sheetUrl1 = import.meta.env.VITE_SERVICE_SHEET_API;
+      // Video-Call gating: same rule as Video-Call.jsx — a ticket is
+      // "in Video-Call" once sss_warranty_check.video_call_planned is set;
+      // pending until the latest sss_video_call attempt lands on something
+      // other than 'rescheduled'.
+      const { data: warrantyRows, error: warrantyError } = await supabase
+        .from('sss_warranty_check')
+        .select('ticket_id, video_call_planned')
+        .not('video_call_planned', 'is', null);
+      if (warrantyError) throw warrantyError;
 
-      if (!sheetUrl1) return;
+      const vcTicketIds = [...new Set((warrantyRows || []).map((w) => w.ticket_id))];
 
-      const videoRes = await fetch(`${sheetUrl1}?sheet=Ticket_Enquiry`);
-      if (!videoRes.ok) throw new Error(`Failed to fetch Ticket_Enquiry: ${videoRes.status}`);
-
-      const masterRes = await fetch(`${sheetUrl1}?sheet=Master`);
-      if (!masterRes.ok) throw new Error(`Failed to fetch Master sheet: ${masterRes.status}`);
-
-      const checkJsonContentType = (res) => {
-        const contentType = res.headers.get("content-type");
-        return contentType && contentType.includes("application/json");
-      };
-
-      if (!checkJsonContentType(videoRes) || !checkJsonContentType(masterRes)) {
-        throw new Error(
-          "Google Apps Script returned HTML instead of JSON. " +
-          "This is a redirect issue when logged into multiple Google accounts in the same browser. " +
-          "Please sign out of other accounts, use an Incognito window, or use Chrome Profiles."
-        );
-      }
-
-      const videoJson = await videoRes.json();
-      const masterJson = await masterRes.json();
-
-      // Fetch material testing data from LTO Supabase
-      const [{ data: receivingRows, error: receivingError }, { data: qcRows, error: qcError }] = await Promise.all([
+      const [
+        vcTicketsRes,
+        vcAttemptsRes,
+        siteVisitRes,
+        tadaRes,
+        warehouseRes,
+        engineerDropdownRes,
+        { data: receivingRows, error: receivingError },
+        { data: qcRows, error: qcError },
+      ] = await Promise.all([
+        vcTicketIds.length
+          ? supabase.from('sss_tickets').select('*').in('ticket_id', vcTicketIds)
+          : Promise.resolve({ data: [] }),
+        vcTicketIds.length
+          ? supabase.from('sss_video_call').select('*').in('ticket_id', vcTicketIds).order('created_at', { ascending: false })
+          : Promise.resolve({ data: [] }),
+        supabase.from('sss_site_visit').select('*'),
+        supabase.from('sss_tada').select('*'),
+        supabase.from('sss_warehouse').select('*'),
+        supabase.from('sss_dropdown').select('value').eq('category', 'engineer_assign_name'),
+        // Material testing data — already on the same Supabase project (ltoSupabase = supabase alias).
         ltoSupabase.from('pfms_view-receiving_accounts').select('indent_number, lift_no, item_name, received_qty, plan7, actual7'),
         ltoSupabase.from('pfms_material-testing').select('lift_no, approved_qty, rejected_qty'),
       ]);
+
+      if (vcTicketsRes.error) throw vcTicketsRes.error;
+      if (vcAttemptsRes.error) throw vcAttemptsRes.error;
+      if (siteVisitRes.error) throw siteVisitRes.error;
+      if (tadaRes.error) throw tadaRes.error;
+      if (warehouseRes.error) throw warehouseRes.error;
+      if (engineerDropdownRes.error) throw engineerDropdownRes.error;
       if (receivingError) throw receivingError;
       if (qcError) throw qcError;
 
+      // ---- Video Call pending/solved stats ----
+      const latestAttemptByTicket = new Map();
+      (vcAttemptsRes.data || []).forEach((a) => {
+        if (!latestAttemptByTicket.has(a.ticket_id)) latestAttemptByTicket.set(a.ticket_id, a);
+      });
+
       let vcPending = 0;
       let vcSolved = 0;
-      let vcRows = [];
-      let svHistory = [];
-      if (videoJson.success && Array.isArray(videoJson.data)) {
-        vcRows = videoJson.data.slice(6)
-          .filter(row => row[1] && String(row[1]).trim() !== "")
-          .map((row, index) => ({
-            id: index + 1,
-            timeStemp: String(row[0] || "").trim(),
-            ticketId: String(row[1] || "").trim(),
-            clientName: String(row[17] || "").trim(),
-            companyName: String(row[16] || "").trim(),
-            category: String(row[23] || "").trim(),
-            phoneNumber: String(row[18] || "").trim(),
-            actual2: String(row[32] || "").trim(),
-          }))
-          .reverse();
+      const vcRows = (vcTicketsRes.data || [])
+        .map((t, index) => {
+          const latest = latestAttemptByTicket.get(t.ticket_id);
+          const isPending = !latest || latest.enquiry_solved === 'rescheduled';
+          if (isPending) vcPending++;
+          else vcSolved++;
 
-        vcRows.forEach(ticket => {
-          if (ticket.actual2 === "") {
-            vcPending++;
-          } else {
-            vcSolved++;
-          }
-        });
-
-        // 1. Parse site visit history
-        const allSvData = videoJson.data.slice(6).map((row, index) => ({
-          id: index + 1,
-          timeStemp: row[0] || "",
-          ticketId: row[1] || "",
-          sourceOfEnquiry: row[12] || "",
-          callType: row[13] || "",
-          enquiryReceiverName: row[14] || "",
-          clientType: row[15] || "",
-          companyName: row[16] || "",
-          clientName: row[17] || "",
-          phoneNumber: row[18] || "",
-          gstAddress: row[19] || "",
-          siteAddress: row[20] || "",
-          gstNo: row[21] || "",
-          machineName: row[22] || "",
-          category: row[23] || "",
-          mentionIssue: row[24] || "",
-          serviceLocation: row[25] || "",
-          emailAddress: row[4] || "",
-          title: row[7] || "",
-          description: row[8] || "",
-          engineerAssign: row[138] || "",
-          warrantyCheck: row[134] || "",
-          siteName: row[20] || "",
-          paymentTerm: row[51] || "",
-          acceptanceVia: row[52] || "",
-          paymentMode: row[54] || "",
-          seniorApproval: row[55] || "",
-          planned5: row[61] || "",
-          actual5: row[62] || "",
-          delay5: row[63] || "",
-          dateOfVisit: String(row[64] || "").trim(),
-          transportation: row[65] || "",
-          CREName: row[127] || "",
-          expectedCompletionDate: String(row[149] || "").trim(),
-          expectedCompletionTime: String(row[150] || "").trim(),
-          travelDate: String(row[82] || "").trim(),
-          returnDate: String(row[83] || "").trim(),
-        }));
-
-        const siteVisitHistory = allSvData.filter(
-          (item) => item.planned5 !== ""
-        ).map(item => ({
-          ...item,
-          type: "Site Visit"
-        }));
-
-        // 2. Parse Video Call history
-        const videoCallHistory = videoJson.data.slice(6).filter(
-          (row) => (row[31] || "") !== ""
-        ).map((row, index) => {
-          const startDate = String(row[31] || "").trim();
-          const videoCallTime = formatCallTime(String(row[153] || "").trim());
           return {
             id: index + 1,
-            timeStemp: row[0] || "",
-            ticketId: row[1] || "",
-            companyName: row[16] || "",
-            clientName: row[17] || "",
-            phoneNumber: row[18] || "",
-            mentionIssue: row[24] || "",
-            engineerAssign: row[156] || row[130] || "",
+            timeStemp: t.created_at || "",
+            ticketId: t.ticket_id || "",
+            clientName: t.client_name || "",
+            companyName: t.company_name || "",
+            category: t.category || "",
+            phoneNumber: t.phone_number || "",
+            actual2: isPending ? "" : String(latest.created_at || "").trim(),
+          };
+        })
+        .reverse();
+
+      // ---- Engineer calendar: Site Visit + Video Call + Repair history ----
+      const calendarTicketUuids = [
+        ...new Set([
+          ...(siteVisitRes.data || []).map((s) => s.ticket_uuid),
+          ...(warehouseRes.data || []).map((w) => w.ticket_uuid),
+        ]),
+      ];
+
+      const { data: calendarTickets, error: calendarTicketsError } = calendarTicketUuids.length
+        ? await supabase.from('sss_tickets').select('*').in('uuid', calendarTicketUuids)
+        : { data: [] };
+      if (calendarTicketsError) throw calendarTicketsError;
+
+      const ticketByUuid = new Map((calendarTickets || []).map((t) => [t.uuid, t]));
+      const tadaByTicketUuid = new Map((tadaRes.data || []).map((x) => [x.ticket_uuid, x]));
+
+      const siteVisitHistory = (siteVisitRes.data || []).map((sv, index) => {
+        const t = ticketByUuid.get(sv.ticket_uuid) || {};
+        const tada = tadaByTicketUuid.get(sv.ticket_uuid);
+        return {
+          id: index + 1,
+          ticketId: sv.ticket_id || t.ticket_id || "",
+          companyName: t.company_name || "",
+          clientName: t.client_name || "",
+          phoneNumber: t.phone_number || "",
+          mentionIssue: t.mention_issue || "",
+          engineerAssign: sv.engineer_assign || "",
+          dateOfVisit: sv.date_of_visit || "",
+          travelDate: tada?.travel_date || sv.date_of_visit || "",
+          returnDate: tada?.return_date || "",
+          expectedCompletionDate: tada?.expected_completion_date || "",
+          expectedCompletionTime: tada?.expected_completion_time || "",
+          CREName: t.cre_name || "",
+          type: "Site Visit",
+        };
+      });
+
+      const videoCallHistory = (vcTicketsRes.data || [])
+        .filter((t) => t.video_call === "Yes")
+        .map((t, index) => {
+          const latest = latestAttemptByTicket.get(t.ticket_id);
+          const startDate = latest?.rescheduled_time || t.created_at || "";
+          return {
+            id: index + 1,
+            ticketId: t.ticket_id || "",
+            companyName: t.company_name || "",
+            clientName: t.client_name || "",
+            phoneNumber: t.phone_number || "",
+            mentionIssue: t.mention_issue || "",
+            engineerAssign: latest?.alternate_engineer || t.engineer_assign || "",
             dateOfVisit: startDate,
             travelDate: startDate,
             returnDate: startDate,
             expectedCompletionDate: startDate,
-            expectedCompletionTime: videoCallTime,
-            CREName: row[127] || "",
-            type: "Video Call"
+            expectedCompletionTime: formatCallTime(String(t.video_call_time || "").trim()),
+            CREName: t.cre_name || "",
+            type: "Video Call",
           };
         });
 
-        // 3. Parse Repair history
-        const repairHistory = videoJson.data.slice(6).filter(
-          (row) => (row[141] || "") !== ""
-        ).map((row, index) => {
-          const startDate = String(row[141] || "").trim();
-          const endDate = String(row[142] || startDate).trim();
-          return {
-            id: index + 1,
-            timeStemp: row[0] || "",
-            ticketId: row[1] || "",
-            companyName: row[16] || "",
-            clientName: row[17] || "",
-            phoneNumber: row[18] || "",
-            mentionIssue: row[24] || "",
-            engineerAssign: row[144] || row[69] || "",
-            dateOfVisit: startDate,
-            travelDate: startDate,
-            returnDate: endDate,
-            expectedCompletionDate: endDate,
-            expectedCompletionTime: "",
-            CREName: row[127] || "",
-            type: "Repair"
-          };
-        });
+      const repairHistory = (warehouseRes.data || []).map((w, index) => {
+        const t = ticketByUuid.get(w.ticket_uuid) || {};
+        const startDate = w.date_of_repair || w.created_at || "";
+        return {
+          id: index + 1,
+          ticketId: w.ticket_id || t.ticket_id || "",
+          companyName: t.company_name || "",
+          clientName: t.client_name || "",
+          phoneNumber: t.phone_number || "",
+          mentionIssue: t.mention_issue || "",
+          engineerAssign: w.assigned_engineer || "",
+          dateOfVisit: startDate,
+          travelDate: startDate,
+          returnDate: startDate,
+          expectedCompletionDate: startDate,
+          expectedCompletionTime: "",
+          CREName: t.cre_name || "",
+          type: "Repair",
+        };
+      });
 
-        svHistory = [
-          ...siteVisitHistory,
-          ...videoCallHistory,
-          ...repairHistory
-        ];
-      }
+      const svHistory = [...siteVisitHistory, ...videoCallHistory, ...repairHistory];
 
-      // Build approved totals map from LTO Supabase QC records
+      // ---- Material testing stats (already Supabase-backed, unchanged) ----
       const approvedMap = new Map();
-      const rejectedMap = new Map();
       (qcRows || []).forEach((r) => {
         const liftNo = String(r.lift_no || '').trim().toLowerCase();
         if (!liftNo) return;
         approvedMap.set(liftNo, (approvedMap.get(liftNo) || 0) + (parseFloat(r.approved_qty || 0)));
-        rejectedMap.set(liftNo, (rejectedMap.get(liftNo) || 0) + (parseFloat(r.rejected_qty || 0)));
       });
 
       let mtPending = 0;
       let mtCompleted = 0;
       let mtRows = [];
       (receivingRows || [])
-        .filter(row => row.indent_number && String(row.indent_number).trim() !== '')
+        .filter((row) => row.indent_number && String(row.indent_number).trim() !== '')
         .forEach((row, index) => {
           const plan7Str = String(row.plan7 || '').trim();
           const actual7Str = String(row.actual7 || '').trim();
@@ -420,28 +411,11 @@ export default function Dashboard() {
         });
       mtRows = mtRows.reverse();
 
-      if (masterJson.success && masterJson.data && masterJson.data.length > 0) {
-        const headers = masterJson.data[0];
-        const structuredData = {};
-        headers.forEach((header) => {
-          structuredData[header] = [];
-        });
-        masterJson.data.slice(1).forEach((row) => {
-          row.forEach((value, index) => {
-            const header = headers[index];
-            if (value !== null && value !== undefined) {
-              const stringValue = String(value).trim();
-              if (stringValue !== "") {
-                structuredData[header].push(stringValue);
-              }
-            }
-          });
-        });
-        Object.keys(structuredData).forEach((key) => {
-          structuredData[key] = [...new Set(structuredData[key])];
-        });
-        setMasterData([structuredData]);
-      }
+      // ---- Engineer filter list for the calendar modal ----
+      const engineerNames = [
+        ...new Set((engineerDropdownRes.data || []).map((r) => String(r.value || "").trim()).filter(Boolean)),
+      ];
+      setMasterData([{ "Engineer Assign Name": engineerNames }]);
 
       setVideoCallStats({ pending: vcPending, solved: vcSolved });
       setMaterialTestingStats({ pending: mtPending, completed: mtCompleted });
@@ -710,8 +684,6 @@ export default function Dashboard() {
   // CONSTANTS
   // ==============================
 
-  const sheet_url = import.meta.env.VITE_SERVICE_SHEET_API;
-
   // ==============================
   // STATES
   // ==============================
@@ -917,43 +889,24 @@ export default function Dashboard() {
     }));
 
     try {
-      const reader = new FileReader();
-      reader.readAsDataURL(file);
+      const filePath = `${field}/${Date.now()}_${file.name}`;
 
-      const base64Data = await new Promise((resolve, reject) => {
-        reader.onload = () => {
-          const result = reader.result.split(",")[1];
-          resolve(result);
-        };
+      const { error: uploadError } = await supabase.storage
+        .from("sss-tickets")
+        .upload(filePath, file, {
+          contentType: file.type,
+          upsert: false,
+        });
 
-        reader.onerror = () => {
-          reject(new Error("Failed to read file"));
-        };
-      });
+      if (uploadError) throw uploadError;
 
-      const response = await fetch(sheet_url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: new URLSearchParams({
-          action: "uploadFile",
-          fileName: `Warehouse_${field}_${Date.now()}_${file.name}`,
-          base64Data,
-          mimeType: file.type,
-          folderId: import.meta.env.VITE_DRIVE_FOLDER_ID,
-        }),
-      });
-
-      const result = await response.json();
-
-      if (!result.success) {
-        throw new Error(result.error || "Failed to upload file");
-      }
+      const { data: publicUrlData } = supabase.storage
+        .from("sss-tickets")
+        .getPublicUrl(filePath);
 
       setNewEnquiryData((prev) => ({
         ...prev,
-        [field]: result.fileUrl,
+        [field]: publicUrlData.publicUrl,
       }));
 
       toast.success(
@@ -964,7 +917,7 @@ export default function Dashboard() {
     } catch (error) {
       console.error(error);
 
-      toast.error(error.message || "Failed to upload file to Google Drive.");
+      toast.error(error.message || "Failed to upload file.");
     } finally {
       setUploadingFiles((prev) => ({
         ...prev,
@@ -973,82 +926,62 @@ export default function Dashboard() {
     }
   };
 
+  // Maps sss_dropdown.category values to the UI's dropdown group names
+  // (kept the same names the form/render code already expects).
+  const DROPDOWN_CATEGORY_KEY_MAP = {
+    call_type: "Call type",
+    category: "Category",
+    sub_category: "Requirement Service Category",
+    enquiry_receiver_name: "Enquiry Receiver Name",
+    machine_name: "Machine Name",
+    service_location: "Service Location",
+    source_of_enquiry: "Source of enquiry",
+    engineer_assign_name: "Engineer Assign Name",
+  };
+
   const fetchMasterSheet = async () => {
     try {
-      const response = await fetch(`${sheet_url}?sheet=DROPDOWN`);
-      const result = await response.json();
+      const [{ data: dropdownRows, error: dropdownError }, { data: clients, error: clientsError }] =
+        await Promise.all([
+          supabase
+            .from("sss_dropdown")
+            .select("category, value")
+            .in("category", Object.keys(DROPDOWN_CATEGORY_KEY_MAP)),
+          supabase
+            .from("lto_client_master")
+            .select("company_name, billing_address, gst_number"),
+        ]);
 
-      if (result.success && result.data && result.data.length > 0) {
-        const headers = result.data[0];
+      if (dropdownError) throw dropdownError;
+      if (clientsError) throw clientsError;
 
-        const structuredData = {};
+      const structuredData = {};
 
-        headers.forEach((header, index) => {
-          let normalizedHeader = header;
+      Object.values(DROPDOWN_CATEGORY_KEY_MAP).forEach((key) => {
+        structuredData[key] = [];
+      });
 
-          if (header === "Enquiry-Receiver-Name")
-            normalizedHeader = "Enquiry Receiver Name";
+      (dropdownRows || []).forEach((row) => {
+        const key = DROPDOWN_CATEGORY_KEY_MAP[row.category];
+        const stringValue =
+          row.value !== null && row.value !== undefined ? String(row.value).trim() : "";
 
-          if (header === "Company-Name")
-            normalizedHeader = "Company Name";
-
-          if (header === "GST-No.")
-            normalizedHeader = "GST No.";
-
-          if (index === 92) {
-            structuredData["Requirement Service Category"] = [];
-          }
-
-          structuredData[normalizedHeader] = [];
-        });
-
-        result.data.slice(1).forEach((row) => {
-          row.forEach((value, index) => {
-            const header = headers[index];
-
-            let normalizedHeader = header;
-
-            if (header === "Enquiry-Receiver-Name")
-              normalizedHeader = "Enquiry Receiver Name";
-
-            if (header === "Company-Name")
-              normalizedHeader = "Company Name";
-
-            if (header === "GST-No.")
-              normalizedHeader = "GST No.";
-
-            const stringValue =
-              value !== null && value !== undefined
-                ? String(value).trim()
-                : "";
-
-            if (structuredData[normalizedHeader]) {
-              structuredData[normalizedHeader].push(stringValue);
-            }
-
-            if (
-              index === 92 &&
-              structuredData["Requirement Service Category"]
-            ) {
-              structuredData["Requirement Service Category"].push(
-                stringValue
-              );
-            }
-          });
-        });
-
-        if (
-          !structuredData["Call type"] ||
-          structuredData["Call type"].filter((x) => x).length === 0
-        ) {
-          structuredData["Call type"] = [
-            "Incoming",
-            "Outgoing",
-          ];
+        if (key && stringValue) {
+          structuredData[key].push(stringValue);
         }
+      });
 
-        setEnquiryMasterData([structuredData]);
+      if (structuredData["Call type"].length === 0) {
+        structuredData["Call type"] = ["Incoming", "Outgoing"];
       }
+
+      // Existing-client autofill (Company Name -> Billing Address / GST No.)
+      // relies on these three arrays staying index-aligned with each other.
+      structuredData["Company Name"] = (clients || []).map((c) => c.company_name || "");
+      structuredData["Billing Address"] = (clients || []).map((c) => c.billing_address || "");
+      structuredData["GST No."] = (clients || []).map((c) => c.gst_number || "");
+
+      setEnquiryMasterData([structuredData]);
     } catch (error) {
       console.error(error);
 
@@ -1096,65 +1029,52 @@ export default function Dashboard() {
     setFetchLoading(true);
 
     try {
-      const response = await fetch(`${sheet_url}?sheet=Ticket_Enquiry`);
-      const json = await response.json();
+      const { data, error } = await supabase
+        .from("sss_tickets")
+        .select("*")
+        .eq("current_stage", "Warranty Check")
+        .order("created_at", { ascending: false });
 
-      if (json.success && Array.isArray(json.data)) {
-        const allData = json.data.slice(6).map((row, index) => ({
-          id: index + 1,
-          timeStemp: row[0] || "",
-          ticketId: row[1] || "",
-          sourceOfEnquiry: row[12] || "",
-          callType: row[13] || "",
-          enquiryReceiverName: row[14] || "",
-          clientType: row[15] || "",
-          companyName: row[16] || "",
-          clientName: row[17] || "",
-          phoneNumber: row[18] || "",
-          gstAddress: row[19] || "",
-          siteAddress: row[20] || "",
-          gstNo: row[21] || "",
-          machineName: row[22] || "",
-          category: row[23] || "",
-          mentionIssue: row[24] || "",
-          serviceLocation: row[25] || "",
-          challanCopy: row[26] || "",
-          machinePhoto: row[27] || "",
-          videoCall: row[28] || "",
-          engineerAssign: row[156] || "",
-          CREName: row[127] || "",
-          planned1: row[9] || "",
-          actual1: row[10] || "",
-          colAI: row[34] || "",
-          colAL: row[37] || "",
-          colDI: row[112] || "",
-          otp: row[35] || "",
-          newCategory: row[152] || "",
-          videoCallTime: row[153] || "",
-        }));
+      if (error) throw error;
 
-        const filteredAllData = allData.filter((ticket) => {
-          const valAI = String(ticket.colAI).trim().toLowerCase();
-          const valAL = String(ticket.colAL).trim();
-          const valDI = String(ticket.colDI).trim();
+      const allData = (data || []).map((row, index) => ({
+        id: index + 1,
+        uuid: row.uuid,
+        timeStemp: row.created_at || "",
+        ticketId: row.ticket_id || "",
+        sourceOfEnquiry: row.source_of_enquiry || "",
+        callType: row.call_type || "",
+        enquiryReceiverName: row.enquiry_receiver_name || "",
+        clientType: row.client_type || "",
+        companyName: row.company_name || "",
+        clientName: row.client_name || "",
+        phoneNumber: row.phone_number || "",
+        gstAddress: row.gst_address || "",
+        siteAddress: row.site_address || "",
+        gstNo: row.gst_no || "",
+        machineName: row.machine_name || "",
+        category: row.category || "",
+        mentionIssue: row.mention_issue || "",
+        serviceLocation: row.service_location || "",
+        challanCopy: row.challan_copy || "",
+        machinePhoto: row.machine_photo || "",
+        videoCall: row.video_call || "",
+        engineerAssign: row.engineer_assign || "",
+        CREName: row.cre_name || "",
+        otp: row.otp || "",
+        newCategory: row.sub_category || "",
+        videoCallTime: row.video_call_time || "",
+      }));
 
-          const isAIYes = valAI === "yes";
-          const isALEmpty = valAL === "";
-          const isDINotEmpty = valDI !== "";
+      const uniqueTicketsMap = new Map();
 
-          return !(isAIYes || isALEmpty || isDINotEmpty);
-        });
+      allData.forEach((ticket) => {
+        if (ticket.ticketId) {
+          uniqueTicketsMap.set(ticket.ticketId, ticket);
+        }
+      });
 
-        const uniqueTicketsMap = new Map();
-
-        filteredAllData.forEach((ticket) => {
-          if (ticket.ticketId) {
-            uniqueTicketsMap.set(ticket.ticketId, ticket);
-          }
-        });
-
-        setPendingData(Array.from(uniqueTicketsMap.values()));
-      }
+      setPendingData(Array.from(uniqueTicketsMap.values()));
     } catch (error) {
       console.error(error);
 
@@ -1339,160 +1259,140 @@ export default function Dashboard() {
     try {
       if (isEditMode && editingTicket) {
         const isLocWarehouse = newEnquiryData.serviceLocation?.trim() === "Warehouse";
-        const columnData = {
-          M: newEnquiryData.sourceOfEnquiry || "",
-          N: newEnquiryData.callType || "",
-          O: newEnquiryData.enquiryReceiverName || "",
-          P: newEnquiryData.clientType || "",
-          Q: newEnquiryData.companyName || "",
-          R: newEnquiryData.clientName || "",
-          S: newEnquiryData.phoneNumber || "",
-          T: newEnquiryData.gstAddress || "",
-          U: newEnquiryData.siteAddress || "",
-          V: newEnquiryData.gstNo || "",
-          W: newFormSelectedMachines.join(", "),
-          X: newEnquiryData.category || "",
-          Y: newEnquiryData.mentionIssue || "",
-          Z: newEnquiryData.serviceLocation || "",
-          AA: isLocWarehouse ? (newEnquiryData.challanCopy || "") : "",
-          AB: isLocWarehouse ? (newEnquiryData.machinePhoto || "") : "",
-          AC: newEnquiryData.videoCall || "",
-          EW: newFormSelectedCategories.join(", "),
-          EX: newEnquiryData.videoCallTime || "",
-          FA: newEnquiryData.engineerAssign || "",
+        const updatePayload = {
+          source_of_enquiry: newEnquiryData.sourceOfEnquiry || "",
+          call_type: newEnquiryData.callType || "",
+          enquiry_receiver_name: newEnquiryData.enquiryReceiverName || "",
+          client_type: newEnquiryData.clientType || "",
+          company_name: newEnquiryData.companyName || "",
+          client_name: newEnquiryData.clientName || "",
+          phone_number: newEnquiryData.phoneNumber || "",
+          gst_address: newEnquiryData.gstAddress || "",
+          site_address: newEnquiryData.siteAddress || "",
+          gst_no: newEnquiryData.gstNo || "",
+          machine_name: newFormSelectedMachines.join(", "),
+          category: newEnquiryData.category || "",
+          mention_issue: newEnquiryData.mentionIssue || "",
+          service_location: newEnquiryData.serviceLocation || "",
+          challan_copy: isLocWarehouse ? (newEnquiryData.challanCopy || "") : "",
+          machine_photo: isLocWarehouse ? (newEnquiryData.machinePhoto || "") : "",
+          video_call: newEnquiryData.videoCall || "",
+          sub_category: newFormSelectedCategories.join(", "),
+          video_call_time: newEnquiryData.videoCallTime || "",
+          engineer_assign: newEnquiryData.engineerAssign || "",
         };
 
-        const response = await fetch(sheet_url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-          },
-          body: new URLSearchParams({
-            sheetId: import.meta.env.VITE_SERVICE_SHEET_ID || import.meta.env.VITE_GOOGLE_SHEET_ID || "1teE4IIdCw7qnQvm_W7xAPgmGgpU13dtYw6y5ui01HHc",
-            sheetName: "Ticket_Enquiry",
-            action: "update",
-            rowIndex: (editingTicket.id + 6).toString(),
-            columnData: JSON.stringify(columnData),
-          }),
+        const { error } = await supabase
+          .from("sss_tickets")
+          .update(updatePayload)
+          .eq("uuid", editingTicket.uuid);
+
+        if (error) throw error;
+
+        toast.success(`Enquiry updated successfully for Ticket ID: ${editingTicket.ticketId}`);
+        setShowNewEnquiryForm(false);
+        setNewEnquiryData({
+          clientType: "New",
+          sourceOfEnquiry: "",
+          callType: "",
+          enquiryReceiverName: "",
+          companyName: "",
+          clientName: "",
+          phoneNumber: "",
+          gstAddress: "",
+          siteAddress: "",
+          gstNo: "",
+          machineName: "",
+          category: "",
+          mentionIssue: "",
+          serviceLocation: "",
+          challanCopy: "",
+          machinePhoto: "",
+          videoCall: "",
+          newCategory: "",
+          videoCallTime: "",
+          engineerAssign: ""
         });
-
-        const result = await response.json();
-
-        if (result.success) {
-          toast.success(`Enquiry updated successfully for Ticket ID: ${editingTicket.ticketId}`);
-          setShowNewEnquiryForm(false);
-          setNewEnquiryData({
-            clientType: "New",
-            sourceOfEnquiry: "",
-            callType: "",
-            enquiryReceiverName: "",
-            companyName: "",
-            clientName: "",
-            phoneNumber: "",
-            gstAddress: "",
-            siteAddress: "",
-            gstNo: "",
-            machineName: "",
-            category: "",
-            mentionIssue: "",
-            serviceLocation: "",
-            challanCopy: "",
-            machinePhoto: "",
-            videoCall: "",
-            newCategory: "",
-            videoCallTime: "",
-            engineerAssign: ""
-          });
-          setNewFormSelectedMachines([]);
-          setNewFormSelectedCategories([]);
-          setIsEditMode(false);
-          setEditingTicket(null);
-          fetchData();
-        } else {
-          throw new Error(result.error || "Failed to update enquiry");
-        }
+        setNewFormSelectedMachines([]);
+        setNewFormSelectedCategories([]);
+        setIsEditMode(false);
+        setEditingTicket(null);
+        fetchData();
       } else {
-        const rowData = Array(160).fill("");
-        rowData[0] = currentDateTime;
-        rowData[1] = "";
-        rowData[9] = currentDateTime;
-
-        rowData[12] = newEnquiryData.sourceOfEnquiry || "";
-        rowData[13] = newEnquiryData.callType || "";
-        rowData[14] = newEnquiryData.enquiryReceiverName || "";
-        rowData[15] = newEnquiryData.clientType || "";
-        rowData[16] = newEnquiryData.companyName || "";
-        rowData[17] = newEnquiryData.clientName || "";
-        rowData[18] = newEnquiryData.phoneNumber || "";
-        rowData[19] = newEnquiryData.gstAddress || "";
-        rowData[20] = newEnquiryData.siteAddress || "";
-        rowData[21] = newEnquiryData.gstNo || "";
-        rowData[22] = newFormSelectedMachines.join(", ");
-        rowData[23] = newEnquiryData.category || "";
-        rowData[24] = newEnquiryData.mentionIssue || "";
-        rowData[25] = newEnquiryData.serviceLocation || "";
-
         const isLocWarehouse = newEnquiryData.serviceLocation?.trim() === "Warehouse";
-        rowData[26] = isLocWarehouse ? (newEnquiryData.challanCopy || "") : "";
-        rowData[27] = isLocWarehouse ? (newEnquiryData.machinePhoto || "") : "";
-        rowData[28] = newEnquiryData.videoCall || "";
+        const ticketSubmittedAt = new Date();
 
-        // EW is index 152, EX is index 153, FA is index 156
-        rowData[152] = newFormSelectedCategories.join(", ");
-        rowData[153] = newEnquiryData.videoCallTime || "";
-        rowData[156] = newEnquiryData.engineerAssign || "";
+        const insertPayload = {
+          source_of_enquiry: newEnquiryData.sourceOfEnquiry || "",
+          call_type: newEnquiryData.callType || "",
+          enquiry_receiver_name: newEnquiryData.enquiryReceiverName || "",
+          client_type: newEnquiryData.clientType || "",
+          company_name: newEnquiryData.companyName || "",
+          client_name: newEnquiryData.clientName || "",
+          phone_number: newEnquiryData.phoneNumber || "",
+          gst_address: newEnquiryData.gstAddress || "",
+          site_address: newEnquiryData.siteAddress || "",
+          gst_no: newEnquiryData.gstNo || "",
+          machine_name: newFormSelectedMachines.join(", "),
+          category: newEnquiryData.category || "",
+          mention_issue: newEnquiryData.mentionIssue || "",
+          service_location: newEnquiryData.serviceLocation || "",
+          challan_copy: isLocWarehouse ? (newEnquiryData.challanCopy || "") : "",
+          machine_photo: isLocWarehouse ? (newEnquiryData.machinePhoto || "") : "",
+          video_call: newEnquiryData.videoCall || "",
+          sub_category: newFormSelectedCategories.join(", "),
+          video_call_time: newEnquiryData.videoCallTime || "",
+          engineer_assign: newEnquiryData.engineerAssign || "",
+          // OTP only when Video-Call is "Yes", same as the old sheet logic.
+          otp: newEnquiryData.videoCall === "Yes" ? generateSixDigitOTP() : "",
+          cre_name: userName || "",
+        };
 
-        // Generate and assign OTP to column AJ (index 35) only when Video-Call is "Yes"
-        rowData[35] = newEnquiryData.videoCall === "Yes" ? generateSixDigitOTP() : "";
-
-        rowData[117] = "No";
-        rowData[127] = userName || "";
-
-        const response = await fetch(sheet_url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-          },
-          body: new URLSearchParams({
-            sheetName: "Ticket_Enquiry",
-            action: "insertTicket",
-            rowData: JSON.stringify(rowData),
-          }),
-        });
-
-        const result = await response.json();
-
-        if (result.success) {
-          toast.success(`Enquiry created successfully with Ticket ID: ${result.ticketId}`);
-          setShowNewEnquiryForm(false);
-          setNewEnquiryData({
-            clientType: "New",
-            sourceOfEnquiry: "",
-            callType: "",
-            enquiryReceiverName: "",
-            companyName: "",
-            clientName: "",
-            phoneNumber: "",
-            gstAddress: "",
-            siteAddress: "",
-            gstNo: "",
-            machineName: "",
-            category: "",
-            mentionIssue: "",
-            serviceLocation: "",
-            challanCopy: "",
-            machinePhoto: "",
-            videoCall: "",
-            newCategory: "",
-            videoCallTime: "",
-            engineerAssign: ""
+        // Gate "Warranty Check" (the next stage) with a planned-by timestamp,
+        // same pattern every other already-migrated page uses for its own
+        // next-stage transition (see stagePlanning.js).
+        try {
+          insertPayload.warranty_check_planned = await computeStagePlanned("warrantyCheck", {
+            ticketSubmittedAt,
           });
-          setNewFormSelectedMachines([]);
-          setNewFormSelectedCategories([]);
-          fetchData();
-        } else {
-          throw new Error(result.error || "Failed to create enquiry");
+        } catch (planningError) {
+          console.error("Failed to compute warranty_check_planned:", planningError);
         }
+
+        const { data: insertedRows, error } = await supabase
+          .from("sss_tickets")
+          .insert(insertPayload)
+          .select("ticket_id");
+
+        if (error) throw error;
+
+        toast.success(`Enquiry created successfully with Ticket ID: ${insertedRows?.[0]?.ticket_id}`);
+        setShowNewEnquiryForm(false);
+        setNewEnquiryData({
+          clientType: "New",
+          sourceOfEnquiry: "",
+          callType: "",
+          enquiryReceiverName: "",
+          companyName: "",
+          clientName: "",
+          phoneNumber: "",
+          gstAddress: "",
+          siteAddress: "",
+          gstNo: "",
+          machineName: "",
+          category: "",
+          mentionIssue: "",
+          serviceLocation: "",
+          challanCopy: "",
+          machinePhoto: "",
+          videoCall: "",
+          newCategory: "",
+          videoCallTime: "",
+          engineerAssign: ""
+        });
+        setNewFormSelectedMachines([]);
+        setNewFormSelectedCategories([]);
+        fetchData();
       }
     } catch (error) {
       console.error("Error saving enquiry:", error);
