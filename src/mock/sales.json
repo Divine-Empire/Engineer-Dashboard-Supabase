@@ -1,0 +1,132 @@
+[
+  {
+    "id": "sale_001",
+    "followUpNo": "FU-1001",
+    "customerName": "Rahul Traders",
+    "phone": "9876543210",
+    "invoiceDate": "2026-05-10",
+    "invoiceNo": "INV-001",
+    "totalAmount": 50000,
+    "receivedAmount": 20000,
+    "pendingAmount": 30000,
+    "status": "partial",
+    "billCopy": "/dummy/invoice.pdf",
+    "followUps": [
+      {
+        "id": 1,
+        "note": "Customer asked for 1 week time",
+        "nextCallingDate": "2026-05-28",
+        "createdAt": "2026-05-20"
+      }
+    ],
+    "payments": [
+      {
+        "id": 1,
+        "amount": 20000,
+        "mode": "online",
+        "proof": "/dummy/proof.jpg",
+        "remarks": "NEFT received",
+        "receivedAt": "2026-05-15"
+      }
+    ]
+  },
+  {
+    "id": "sale_002",
+    "followUpNo": "FU-1002",
+    "customerName": "Aditya Enterprises",
+    "phone": "8765432109",
+    "invoiceDate": "2026-05-12",
+    "invoiceNo": "INV-002",
+    "totalAmount": 80000,
+    "receivedAmount": 80000,
+    "pendingAmount": 0,
+    "status": "received",
+    "billCopy": "/dummy/invoice2.pdf",
+    "followUps": [],
+    "payments": [
+      {
+        "id": 1,
+        "amount": 80000,
+        "mode": "cheque",
+        "proof": "/dummy/cheque.jpg",
+        "remarks": "Cheque cleared",
+        "receivedAt": "2026-05-14"
+      }
+    ]
+  },
+  {
+    "id": "sale_003",
+    "followUpNo": "FU-1003",
+    "customerName": "Verma Industries",
+    "phone": "7654321098",
+    "invoiceDate": "2026-05-14",
+    "invoiceNo": "INV-003",
+    "totalAmount": 120000,
+    "receivedAmount": 0,
+    "pendingAmount": 120000,
+    "status": "pending",
+    "billCopy": "/dummy/invoice3.pdf",
+    "followUps": [
+      {
+        "id": 1,
+        "note": "Follow up scheduled. Needs reminder.",
+        "nextCallingDate": "2026-05-21",
+        "createdAt": "2026-05-19"
+      }
+    ],
+    "payments": []
+  },
+  {
+    "id": "sale_004",
+    "followUpNo": "FU-1004",
+    "customerName": "Karan Logistics",
+    "phone": "6543210987",
+    "invoiceDate": "2026-05-02",
+    "invoiceNo": "INV-004",
+    "totalAmount": 45000,
+    "receivedAmount": 15000,
+    "pendingAmount": 30000,
+    "status": "partial",
+    "billCopy": "/dummy/invoice4.pdf",
+    "followUps": [
+      {
+        "id": 1,
+        "note": "Promised payment by 15th, missed it.",
+        "nextCallingDate": "2026-05-19",
+        "createdAt": "2026-05-15"
+      }
+    ],
+    "payments": [
+      {
+        "id": 1,
+        "amount": 15000,
+        "mode": "cash",
+        "proof": "/dummy/cash.jpg",
+        "remarks": "Cash collection",
+        "receivedAt": "2026-05-10"
+      }
+    ]
+  },
+  {
+    "id": "sale_005",
+    "followUpNo": "FU-1005",
+    "customerName": "Apex Solutions",
+    "phone": "9988776655",
+    "invoiceDate": "2026-04-20",
+    "invoiceNo": "INV-005",
+    "totalAmount": 150000,
+    "receivedAmount": 0,
+    "pendingAmount": 150000,
+    "status": "pending",
+    "billCopy": "/dummy/invoice5.pdf",
+    "followUps": [
+      {
+        "id": 1,
+        "note": "Dispute on goods quality. Under discussion.",
+        "nextCallingDate": "2026-05-25",
+        "createdAt": "2026-05-01"
+      }
+    ],
+    "payments": []
+  }
+]

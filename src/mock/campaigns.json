@@ -1,0 +1,42 @@
+[
+  {
+    "id": "camp_001",
+    "name": "Pending Payments Auto-Reminder",
+    "type": "Pending Payments",
+    "audienceCount": 12,
+    "sentCount": 10,
+    "pendingCount": 2,
+    "lastSent": "2026-05-18 10:30 AM",
+    "status": "active"
+  },
+  {
+    "id": "camp_002",
+    "name": "Overdue Payments Warning",
+    "type": "Overdue Payments",
+    "audienceCount": 5,
+    "sentCount": 5,
+    "pendingCount": 0,
+    "lastSent": "2026-05-15 02:15 PM",
+    "status": "sent"
+  },
+  {
+    "id": "camp_003",
+    "name": "Follow-up Call Scheduled Reminder",
+    "type": "Follow-up Reminder",
+    "audienceCount": 8,
+    "sentCount": 4,
+    "pendingCount": 4,
+    "lastSent": "2026-05-19 09:00 AM",
+    "status": "paused"
+  },
+  {
+    "id": "camp_004",
+    "name": "Weekend Grace Period Notice",
+    "type": "Pending Payments",
+    "audienceCount": 15,
+    "sentCount": 0,
+    "pendingCount": 15,
+    "lastSent": "Never",
+    "status": "draft"
+  }
+]
