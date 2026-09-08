@@ -9,7 +9,6 @@ import RepairStatus from '../pages/Repair-Status/repair-status';
 import ServiceInstallation from '../pages/service-installation/service-installation';
 import TADA from '../pages/TADA/TADA';
 import SiteVisitOTPVerification from '../pages/OTP-Verification/SiteVisitOTPVerification';
-import SiteVisitDetail from '../pages/Site-Visit-Detail/SiteVisitDetail';
 
 export default function AppRoutes() {
 
@@ -30,7 +29,6 @@ export default function AppRoutes() {
           <Route path="/service-installation" element={<ServiceInstallation />} />
           <Route path="/tada" element={<TADA />} />
           <Route path="/site-visit-otp-verification" element={<SiteVisitOTPVerification />} />
-          <Route path="/site-visit-detail" element={<SiteVisitDetail />} />
         </Route>
 
         <Route path="*" element={<Navigate to="/" replace />} />

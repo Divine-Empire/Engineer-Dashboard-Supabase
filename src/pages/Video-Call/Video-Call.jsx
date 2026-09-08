@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Search,
   ChevronLeft,
@@ -12,6 +12,7 @@ import ModalWrapper from '../../components/ModalWrapper';
 import formatDate from '../../utils/formatDate';
 import toast from 'react-hot-toast';
 import { supabase } from '../../lib/supabase/client';
+import { fetchDropdownRows } from '../../lib/supabase/dropdown';
 
 const INITIAL_COLUMNS = [
   'Ticket-ID',
@@ -233,12 +234,10 @@ export default function VideoCall() {
 
   const fetchMasterSheet = async () => {
     try {
-      const { data, error } = await supabase
-        .from('sss_dropdown')
-        .select('category, value')
-        .in('category', Object.keys(DROPDOWN_CATEGORY_TO_KEY));
-
-      if (error) throw error;
+      // Paginated fetch — a plain unpaginated .select() silently truncates
+      // at Supabase's default 1000-row cap, which item_name alone blows
+      // past on its own (~1400 rows), dropping other categories' values.
+      const data = await fetchDropdownRows(Object.keys(DROPDOWN_CATEGORY_TO_KEY));
 
       const structuredData = {};
       (data || []).forEach(({ category, value }) => {
@@ -720,7 +719,6 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
 
   // Editable fields
   const [videoCallServicesSolve, setVideoCallServicesSolve] = useState('');
-  const [engineerAssign, setEngineerAssign] = useState('');
   const [serviceType, setServiceType] = useState('');
   const [otpVerification, setOtpVerification] = useState('');
   const [remarks, setRemarks] = useState('');
@@ -732,18 +730,62 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
   const [isResending, setIsResending] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
+  // Audio recording upload — picked file only, actual upload happens at
+  // submit time in handleSubmit (same as the main app's own VideoCallSolution.jsx).
+  const [audioFile, setAudioFile] = useState(null);
+  const [audioUrl, setAudioUrl] = useState('');
+  const [isUploadingAudio, setIsUploadingAudio] = useState(false);
+
   useEffect(() => {
     if (sale) {
       setIsCancelled(false);
       setCancelRemarks('');
       setVideoCallServicesSolve('');
-      setEngineerAssign(sale.engineerAssign || sale.engineerAssignFA || '');
       setServiceType(sale.serviceType || '');
       setOtpVerification('');
       setRemarks('');
       setItemRows([{ item: "", qty: "" }]);
+      setAudioFile(null);
+      setAudioUrl(sale.audioUrl || '');
     }
   }, [sale]);
+
+  const handleAudioFileSelect = (file) => {
+    const MAX_SIZE = 10 * 1024 * 1024; // 10MB
+    if (file.size > MAX_SIZE) {
+      toast.error("Audio file size exceeds the 10MB limit.");
+      return;
+    }
+    setAudioFile(file);
+  };
+
+  const removeAudioFile = () => {
+    setAudioFile(null);
+    setAudioUrl('');
+  };
+
+  const uploadAudioToDrive = async (file) => {
+    setIsUploadingAudio(true);
+    try {
+      const path = `video_call/${sale.ticketId}_${Date.now()}_${file.name}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from("ticket_enquiry")
+        .upload(path, file, { contentType: file.type });
+
+      if (uploadError) throw uploadError;
+
+      const { data } = supabase.storage.from("ticket_enquiry").getPublicUrl(path);
+
+      return { success: true, fileUrl: data.publicUrl };
+    } catch (error) {
+      console.error("Error uploading audio:", error);
+      toast.error(error.message || "Failed to upload audio");
+      return { success: false, error: error.message };
+    } finally {
+      setIsUploadingAudio(false);
+    }
+  };
 
   useEffect(() => {
     const storedGenerations = localStorage.getItem("lastOtpGenerations");
@@ -860,11 +902,6 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
       return;
     }
 
-    if (!engineerAssign) {
-      toast.error("Please Select Engineer Name");
-      return;
-    }
-
     if (videoCallServicesSolve === "no" && !serviceType) {
       toast.error("Please Select Service Type");
       return;
@@ -875,7 +912,7 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
         toast.error("Wrong OTP, Please Enter Right OTP");
         return;
       }
-    } else {
+    } else if (videoCallServicesSolve === "no") {
       const validRows = itemRows.filter(row => row.item.trim() !== "" && row.qty.toString().trim() !== "");
       if (validRows.length === 0) {
         toast.error("Please add at least one item and quantity.");
@@ -894,16 +931,8 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
     setSubmitting(true);
 
     try {
-      // Confirms/reassigns the engineer on the ticket itself — same field
-      // Video-Call always drove in the legacy sheet.
-      const { error: ticketError } = await supabase
-        .from('sss_tickets')
-        .update({ engineer_assign: engineerAssign })
-        .eq('uuid', sale.id);
-      if (ticketError) throw ticketError;
-
       // Every submission is its own attempt row (see loadSales above) —
-      // same shape as the main app's src/pages/VideoCallSolution.jsx insert.
+      // same shape as the main app's own src/pages/VideoCallSolution.jsx insert.
       const insertPayload = {
         ticket_id: sale.ticketId,
         ticket_uuid: sale.id,
@@ -921,6 +950,17 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
           .filter((row) => row.item.trim() !== "")
           .map((row) => ({ item: row.item.trim(), qty: row.qty }));
         insertPayload.service_type = serviceType || "";
+
+        // Audio only uploads now, at submit time — not when the file was picked.
+        if (audioFile) {
+          const uploadResult = await uploadAudioToDrive(audioFile);
+          if (!uploadResult.success) {
+            throw new Error(uploadResult.error || "Failed to upload audio");
+          }
+          insertPayload.audio_link = uploadResult.fileUrl;
+        } else {
+          insertPayload.audio_link = audioUrl || "";
+        }
       }
 
       const { error } = await supabase.from('sss_video_call').insert(insertPayload);
@@ -940,8 +980,8 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
   const inputCls = "block w-full text-xs bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white transition-all";
   const labelCls = "text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1 block";
 
-  const engineers = masterData["Engineer Assign Name"] || [];
   const locations = masterData["Service Location"] || [];
+  const itemNames = masterData["Item-Name"] || [];
 
   return (
     <ModalWrapper isOpen={isOpen} onClose={onClose} title={`Solution for Ticket: ${sale.ticketId}`} maxWidth="max-w-2xl">
@@ -998,20 +1038,6 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
                   <option value="no">No</option>
                 </select>
               </div>
-              <div>
-                <label className={labelCls}>Engineer Name *</label>
-                <select
-                  value={engineerAssign}
-                  onChange={(e) => setEngineerAssign(e.target.value)}
-                  required
-                  className={inputCls}
-                >
-                  <option value="">Select Engineer</option>
-                  {engineers.map((name, idx) => (
-                    <option key={idx} value={name}>{name}</option>
-                  ))}
-                </select>
-              </div>
             </div>
 
             {videoCallServicesSolve === "no" && (
@@ -1031,9 +1057,54 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
                   </select>
                 </div>
 
+                {/* Audio Recording Upload */}
+                <div>
+                  <label className={labelCls}>Audio Recording (max 10MB)</label>
+                  {audioFile ? (
+                    <div className="flex items-center justify-between border border-indigo-200 rounded-xl p-2.5 bg-indigo-50 text-indigo-800 text-xs">
+                      <span className="truncate max-w-[70%]" title={audioFile.name}>
+                        {audioFile.name}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={removeAudioFile}
+                        className="text-rose-500 hover:text-rose-700 text-xs font-bold px-2 py-1 rounded-lg hover:bg-rose-50 transition-colors"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ) : audioUrl ? (
+                    <div className="flex items-center justify-between border border-emerald-200 rounded-xl p-2.5 bg-emerald-50 text-emerald-800 text-xs">
+                      <a href={audioUrl} target="_blank" rel="noopener noreferrer" className="font-bold underline truncate max-w-[70%]">
+                        View Uploaded Audio
+                      </a>
+                      <button
+                        type="button"
+                        onClick={removeAudioFile}
+                        className="text-rose-500 hover:text-rose-700 text-xs font-bold px-2 py-1 rounded-lg hover:bg-rose-50 transition-colors"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ) : (
+                    <input
+                      type="file"
+                      accept="audio/*"
+                      onChange={(e) => {
+                        if (e.target.files?.[0]) {
+                          handleAudioFileSelect(e.target.files[0]);
+                        }
+                      }}
+                      className={inputCls}
+                    />
+                  )}
+                </div>
+
                 {/* Spare Item Quantity Table */}
-                <div className="border border-slate-150 rounded-xl overflow-hidden bg-white">
-                  <div className="flex justify-between items-center p-3 bg-slate-50 border-b border-slate-150">
+                {/* No overflow-hidden here — it would clip the Item Name
+                    combobox's dropdown list, which pops below each row. */}
+                <div className="border border-slate-150 rounded-xl bg-white">
+                  <div className="flex justify-between items-center p-3 bg-slate-50 border-b border-slate-150 rounded-t-xl">
                     <span className="text-xs font-bold text-slate-700">Spare Item & Qty Details</span>
                     <button
                       type="button"
@@ -1056,13 +1127,11 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
                       {itemRows.map((row, index) => (
                         <tr key={index}>
                           <td className="p-2.5">
-                            <input
-                              type="text"
-                              required={index === 0}
-                              placeholder="Enter item name..."
+                            <ItemNameCombo
                               value={row.item}
-                              onChange={(e) => handleItemRowChange(index, "item", e.target.value)}
-                              className="w-full bg-slate-50 border border-slate-200 rounded-lg p-1.5 focus:outline-none focus:bg-white text-xs"
+                              onChange={(value) => handleItemRowChange(index, "item", value)}
+                              options={itemNames}
+                              required={index === 0}
                             />
                           </td>
                           <td className="p-2.5">
@@ -1131,16 +1200,18 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
               </div>
             )}
 
-            <div>
-              <label className={labelCls}>Remarks</label>
-              <textarea
-                value={remarks}
-                onChange={(e) => setRemarks(e.target.value)}
-                placeholder="Enter remarks..."
-                rows={3}
-                className={`${inputCls} resize-none`}
-              />
-            </div>
+            {(videoCallServicesSolve === "yes" || videoCallServicesSolve === "no") && (
+              <div>
+                <label className={labelCls}>Remarks</label>
+                <textarea
+                  value={remarks}
+                  onChange={(e) => setRemarks(e.target.value)}
+                  placeholder="Enter remarks..."
+                  rows={3}
+                  className={`${inputCls} resize-none`}
+                />
+              </div>
+            )}
           </div>
         ) : (
           <div className="space-y-4">
@@ -1182,5 +1253,59 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
         </div>
       </form>
     </ModalWrapper>
+  );
+}
+
+// Subcomponent: searchable Item Name dropdown (typing filters the same
+// master "Item-Name" list the plain <select> options used to come from).
+function ItemNameCombo({ value, onChange, options, required }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const wrapperRef = useRef(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(event.target)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const filteredOptions = options.filter((opt) =>
+    opt.toLowerCase().includes((value || '').toLowerCase())
+  );
+
+  return (
+    <div className="relative" ref={wrapperRef}>
+      <input
+        type="text"
+        required={required}
+        placeholder="Search item..."
+        value={value}
+        onChange={(e) => {
+          onChange(e.target.value);
+          setIsOpen(true);
+        }}
+        onFocus={() => setIsOpen(true)}
+        className="w-full bg-slate-50 border border-slate-200 rounded-lg p-1.5 focus:outline-none focus:bg-white text-xs"
+      />
+      {isOpen && filteredOptions.length > 0 && (
+        <div className="absolute z-20 mt-1 w-full max-h-40 overflow-y-auto bg-white border border-slate-200 rounded-lg shadow-lg">
+          {filteredOptions.map((opt) => (
+            <div
+              key={opt}
+              onClick={() => {
+                onChange(opt);
+                setIsOpen(false);
+              }}
+              className="px-2.5 py-1.5 text-xs text-slate-600 hover:bg-indigo-50 cursor-pointer select-none"
+            >
+              {opt}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }

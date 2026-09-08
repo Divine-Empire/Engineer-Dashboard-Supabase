@@ -14,8 +14,7 @@ import {
   Wrench,
   ClipboardCheck,
   Car,
-  ShieldCheck,
-  ClipboardList
+  ShieldCheck
 } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 
@@ -36,7 +35,6 @@ const Sidebar = ({ isOpen, onClose }) => {
     { path: '/material-testing', icon: Handshake, label: 'Material Testing' },
     { path: '/tada', icon: Car, label: 'TADA' },
     { path: '/site-visit-otp-verification', icon: ShieldCheck, label: 'OTP Verification' },
-    { path: '/site-visit-detail', icon: ClipboardList, label: 'Site Visit Detail' },
     // { path: '/tally',       icon: GitCompare,   label: 'Tally' },
     // { path: '/campaigns',   icon: Megaphone,    label: 'Campaigns' },
     // { path: '/settings',    icon: Settings,     label: 'Settings' },
@@ -50,7 +48,6 @@ const Sidebar = ({ isOpen, onClose }) => {
     { path: '/material-testing', icon: Handshake, label: 'Material Testing' },
     { path: '/tada', icon: Car, label: 'TADA' },
     { path: '/site-visit-otp-verification', icon: ShieldCheck, label: 'OTP Verification' },
-    { path: '/site-visit-detail', icon: ClipboardList, label: 'Site Visit Detail' },
     // { path: '/tally',       icon: GitCompare,   label: 'Tally' },
     // { path: '/campaigns',   icon: Megaphone,    label: 'Campaigns' },
   ];

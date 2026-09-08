@@ -3,27 +3,27 @@ import {
   Card,
   CardContent,
   CardHeader,
-} from "../../components/ui/card";
-import { Button } from "../../components/ui/button";
-import { Input } from "../../components/ui/input";
-import { Label } from "../../components/ui/label";
+} from "../components/ui/card";
+import { Button } from "../components/ui/button";
+import { Input } from "../components/ui/input";
+import { Label } from "../components/ui/label";
 import {
   Tabs,
   TabsContent,
   TabsList,
   TabsTrigger,
-} from "../../components/ui/tabs";
+} from "../components/ui/tabs";
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "../../components/ui/select";
-import { Modal } from "../../components/ui/modal";
-import { useToast } from "../../hooks/use-toast";
+} from "../components/ui/select";
+import { Modal } from "../components/ui/modal";
+import { useToast } from "../hooks/use-toast";
 import { Loader2Icon, LoaderIcon } from "lucide-react";
-import { supabase } from "../../lib/supabase/client";
+import { supabase } from "../lib/supabase/client";
 
 export default function SiteVisitOTPVerification() {
   const [lastOtpGenerations, setLastOtpGenerations] = useState({});
