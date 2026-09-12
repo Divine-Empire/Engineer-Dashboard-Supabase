@@ -19,7 +19,7 @@ import toast from "react-hot-toast";
 import { Eye, Loader2Icon, LoaderIcon } from "lucide-react";
 import { Textarea } from "../../components/ui/textarea";
 import { supabase } from "../../lib/supabase/client";
-import { computeStagePlanned } from "../../lib/supabase/stagePlanning";
+import { sendTadaApprovalEmail } from "../../lib/notifications/email";
 
 const formatInputDate = (dateStr) => {
   if (!dateStr) return "";
@@ -244,6 +244,11 @@ export default function TADA() {
       amount: "",
       expectedCompletionDate: "",
       expectedCompletionTime: "",
+      // Accounts/approval-email fields — see handleSubmit below.
+      previousAdvanceDate: "",
+      previousAdvanceSettlementDate: "",
+      previousAdvanceBalance: "",
+      balanceAmount: "",
     });
     setShowTADAModal(true);
   };
@@ -255,16 +260,30 @@ export default function TADA() {
   const handleSubmit = async (e) => {
     e.preventDefault();
 
+    if (
+      !formData.previousAdvanceDate ||
+      !formData.previousAdvanceSettlementDate ||
+      formData.previousAdvanceBalance === "" ||
+      formData.previousAdvanceBalance === undefined ||
+      formData.previousAdvanceBalance === null ||
+      formData.balanceAmount === "" ||
+      formData.balanceAmount === undefined ||
+      formData.balanceAmount === null
+    ) {
+      toast.error("Please fill in all Previous Advance Details fields");
+      return;
+    }
+
     setIsSubmitting(true);
 
     try {
-      // Readiness stamp for the next stage (OTP Verification) — same rule
-      // the main app's src/pages/TADA.jsx uses (stagePlanning.js).
-      const submittedAt = new Date();
-      const otpVerificationPlanned = await computeStagePlanned("otpVerification", {
-        tadaSubmittedAt: submittedAt,
-      });
-
+      // otp_verification_planned is NOT set here anymore — a Senior
+      // Approval stage now sits between TADA and Site Visit (Verification
+      // OTP), same as the main Service-Support-Supabase app's
+      // src/pages/TADA.jsx. It only gets set once a senior approves this
+      // ticket's TADA/advance request on the public /tada-decision page
+      // (main app); rejecting leaves it null forever, parking the ticket in
+      // TADA Approval's History with no path forward.
       const { error } = await supabase.from("sss_tada").insert({
         ticket_id: selectedTicket.ticketId,
         ticket_uuid: selectedTicket.id,
@@ -275,12 +294,55 @@ export default function TADA() {
         amount: formData.amount || null,
         expected_completion_date: formData.expectedCompletionDate || null,
         expected_completion_time: formData.expectedCompletionTime || null,
-        otp_verification_planned: otpVerificationPlanned,
+        previous_advance_date: formData.previousAdvanceDate || null,
+        previous_advance_settlement_date: formData.previousAdvanceSettlementDate || null,
+        previous_advance_balance: formData.previousAdvanceBalance || null,
+        balance_amount: formData.balanceAmount || null,
       });
 
       if (error) throw error;
 
-      toast.success("Ticket details saved successfully");
+      // Create the Senior Approval tracking row + fire its email. Neither
+      // failing should undo the TADA submission above — worst case, the
+      // ticket just sits in the main app's TADA Approval Pending tab until
+      // someone uses its "Resend Email" button.
+      const token = crypto.randomUUID();
+      const { error: approvalError } = await supabase.from("sss_senior_approval").insert({
+        ticket_id: selectedTicket.ticketId,
+        ticket_uuid: selectedTicket.id,
+        token,
+      });
+
+      if (approvalError) {
+        console.error("Error creating senior approval record:", approvalError);
+        toast.error("TADA saved, but the approval request record could not be created.");
+      } else {
+        sendTadaApprovalEmail({
+          token,
+          ticketId: selectedTicket.ticketId,
+          companyName: selectedTicket.companyName,
+          siteAddress: formData.siteName || selectedTicket.siteAddress,
+          machineName: formData.machineName,
+          travelDate: formData.travelDate,
+          returnDate: formData.returnDate,
+          amount: formData.amount,
+          purposeOfTravel: formData.purposeOfTravel,
+          previousAdvanceDate: formData.previousAdvanceDate,
+          previousAdvanceSettlementDate: formData.previousAdvanceSettlementDate,
+          previousAdvanceBalance: formData.previousAdvanceBalance,
+          balanceAmount: formData.balanceAmount,
+          engineerName: formData.engineerAssign || selectedTicket.engineerAssign,
+        }).then(({ success, error: emailError }) => {
+          if (!success) {
+            toast.error(
+              emailError ||
+                "TADA saved, but the approval email could not be sent. Use 'Resend Email' from the main app's TADA Approval page."
+            );
+          }
+        });
+      }
+
+      toast.success("Ticket details saved — sent for Senior Approval.");
       setShowTADAModal(false);
       fetchData();
     } catch (error) {
@@ -1309,6 +1371,74 @@ export default function TADA() {
                         handleInputChange("amount", e.target.value)
                       }
                       data-testid="input-amount"
+                      className="border-gray-300 rounded-lg py-2 px-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                    />
+                  </div>
+
+                  <div className="md:col-span-2 pt-4 border-t border-gray-200">
+                    <h4 className="text-sm font-semibold text-gray-700">
+                      Previous Advance Details (for Accounts Approval Email)
+                    </h4>
+                  </div>
+
+                  <div className="space-y-1">
+                    <Label className="text-gray-600 font-medium">
+                      Previous Advance Date *
+                    </Label>
+                    <Input
+                      type="date"
+                      value={formData.previousAdvanceDate || ""}
+                      onChange={(e) =>
+                        handleInputChange("previousAdvanceDate", e.target.value)
+                      }
+                      data-testid="input-previous-advance-date"
+                      className="border-gray-300 rounded-lg py-2 px-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <Label className="text-gray-600 font-medium">
+                      Previous Advance Settlement Date *
+                    </Label>
+                    <Input
+                      type="date"
+                      value={formData.previousAdvanceSettlementDate || ""}
+                      onChange={(e) =>
+                        handleInputChange("previousAdvanceSettlementDate", e.target.value)
+                      }
+                      data-testid="input-previous-advance-settlement-date"
+                      className="border-gray-300 rounded-lg py-2 px-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <Label className="text-gray-600 font-medium">
+                      Previous Advance Balance (₹) *
+                    </Label>
+                    <Input
+                      type="number"
+                      placeholder="Amount left over from the previous advance"
+                      value={formData.previousAdvanceBalance || ""}
+                      onChange={(e) =>
+                        handleInputChange("previousAdvanceBalance", e.target.value)
+                      }
+                      data-testid="input-previous-advance-balance"
+                      className="border-gray-300 rounded-lg py-2 px-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                    />
+                  </div>
+
+                  <div className="md:col-span-2 space-y-1">
+                    <Label className="text-gray-600 font-medium">
+                      Balance Amount (₹) *
+                    </Label>
+                    <Input
+                      type="number"
+                      placeholder="Net amount receivable/payable this time"
+                      value={formData.balanceAmount || ""}
+                      onChange={(e) =>
+                        handleInputChange("balanceAmount", e.target.value)
+                      }
+                      data-testid="input-balance-amount"
                       className="border-gray-300 rounded-lg py-2 px-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                     />
                   </div>
