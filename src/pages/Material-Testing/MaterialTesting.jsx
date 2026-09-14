@@ -83,9 +83,14 @@ export default function MaterialTesting() {
 
   // Real schema (verified live against the PFMS production project,
   // 2026-09-04 — see [[material-testing-migration]] memory):
-  //   - pfms_dropdown is a WIDE table (named columns, not category/value) —
-  //     "Checked By" / "QC-Checklist" / "Reject Type (QC)", values scattered
-  //     across many rows.
+  //   - pfms_dropdown was migrated 2026-09-10 from a WIDE table (named
+  //     columns) to a NORMALIZED (id, category, value) table — see
+  //     Purchase-FMS-Supabase/sql-queries/2026-09-10_item-master-rename_
+  //     dropdown-restructure_purchaser-backfill.sql and its own
+  //     app/api/dropdowns/route.ts. The old "Checked By" column/category was
+  //     NOT migrated — QC engineer names now live under category 'Engineers'
+  //     instead. "QC-Checklist" and "Reject Type (QC)" migrated as-is, just
+  //     as category values instead of columns.
   //   - pfms_material-testing is ONE row per lift, NOT a log. It's created
   //     upstream by Purchase-FMS-Supabase's own material-received stage,
   //     ONLY when that lift's qcRequirement = 'yes' (app/api/material-received
@@ -113,12 +118,15 @@ export default function MaterialTesting() {
     try {
       const { data: dropRows, error: dropError } = await pfmsSupabase
         .from('pfms_dropdown')
-        .select('"Checked By","QC-Checklist","Reject Type (QC)"');
+        .select('category, value')
+        .in('category', ['Engineers', 'QC-Checklist', 'Reject Type (QC)']);
       if (dropError) throw dropError;
       if (dropRows) {
-        setQcEngineerList([...new Set(dropRows.map((r) => r['Checked By']).filter(Boolean))]);
-        setChecklistList([...new Set(dropRows.map((r) => r['QC-Checklist']).filter(Boolean))]);
-        setRejectTypeList([...new Set(dropRows.map((r) => r['Reject Type (QC)']).filter(Boolean))]);
+        const byCategory = (cat) =>
+          [...new Set(dropRows.filter((r) => r.category === cat).map((r) => r.value).filter(Boolean))];
+        setQcEngineerList(byCategory('Engineers'));
+        setChecklistList(byCategory('QC-Checklist'));
+        setRejectTypeList(byCategory('Reject Type (QC)'));
       }
 
       // Same nested embed Purchase-FMS-Supabase's own GET route uses.
