@@ -128,7 +128,7 @@ export default function MaterialTesting() {
           *,
           lift:pfms_lift!inner (
             liftNo,
-            indent:pfms_indent-generation!inner (
+            indent:pfms_indent_generation!inner (
               indentNo,
               itemName,
               category,
