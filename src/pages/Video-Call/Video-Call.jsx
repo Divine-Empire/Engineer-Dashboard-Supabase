@@ -22,6 +22,7 @@ const INITIAL_COLUMNS = [
   'Machine Name',
   'Mention Issue',
   'Call Time',
+  'Date',
 ];
 
 const ALL_COLUMNS = [
