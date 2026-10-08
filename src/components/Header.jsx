@@ -3,19 +3,26 @@ import { Bell, User, Menu, LogOut } from 'lucide-react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '../store/authStore';
 
+const PAGE_TITLES = [
+  ['/dashboard', 'Dashboard'],
+  ['/service-installation', 'Service Installation'],
+  ['/video-call', 'Video Call'],
+  ['/repair-status', 'Repair Status'],
+  ['/material-testing', 'Material Testing'],
+  ['/tada', 'TADA'],
+  ['/site-visit-otp-verification', 'OTP Verification'],
+];
+
 const Header = ({ onMenuClick, user }) => {
   const navigate = useNavigate();
   const location = useLocation();
   const { logout } = useAuthStore();
 
+  // Keep in sync with the routes in app/routes.jsx and the labels in Sidebar.jsx.
   const getStageName = () => {
     const path = location.pathname;
-    if (path.startsWith('/dashboard')) return 'Dashboard';
-    if (path.startsWith('/followup')) return 'Follow Up';
-    if (path.startsWith('/tally')) return 'Tally';
-    if (path.startsWith('/campaigns')) return 'Campaigns';
-    if (path.startsWith('/settings')) return 'Settings';
-    return 'Dashboard';
+    const match = PAGE_TITLES.find(([prefix]) => path.startsWith(prefix));
+    return match ? match[1] : 'Dashboard';
   };
 
   const handleLogout = () => {

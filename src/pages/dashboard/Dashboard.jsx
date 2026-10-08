@@ -18,7 +18,6 @@ import formatDate from '../../utils/formatDate';
 import VisitCalendarModal from './VisitCalendarModal';
 import { useAuthStore } from '../../store/authStore';
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip } from "recharts";
-import { ltoSupabase } from '../../lib/supabase/ltoClient';
 import { supabase } from '../../lib/supabase/client';
 import { computeStagePlanned } from '../../lib/supabase/stagePlanning';
 
@@ -212,6 +211,47 @@ export default function Dashboard() {
   const [siteVisitHistory, setSiteVisitHistory] = useState([]);
   const [masterData, setMasterData] = useState([]);
 
+  // Same Pending/History rule as the Material Testing page: a lift's own
+  // pendingQty > 0 is Pending, 0 is Completed; cancelled indents are not Pending.
+  const loadQcStats = async () => {
+    try {
+      const res = await fetch('/api/material-testing');
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+
+      const cancelled = new Set(body.cancelledNos || []);
+      const first = (v) => (Array.isArray(v) ? v[0] || {} : v || {});
+      let pending = 0;
+      let completed = 0;
+      const rows = [];
+      (body.testings || []).forEach((t) => {
+        const lift = t.lift || {};
+        const indent = lift.indent || {};
+        const received = first(lift.materialReceived);
+        const receivedQty = parseFloat(received.receivedQty || 0);
+        const pendingQty = t.pendingQty ?? receivedQty;
+        const status = pendingQty > 0 ? 'pending' : 'completed';
+        if (status === 'pending' && cancelled.has(indent.indentNo)) return;
+
+        rows.push({
+          id: rows.length + 1,
+          indentNumber: String(indent.indentNo || '').trim(),
+          liftNo: String(lift.liftNo || '').trim(),
+          itemName: String(indent.itemName || '').trim(),
+          receivedQty: received.receivedQty || '0',
+          approvedQty: t.approvedQty || 0,
+          status,
+        });
+        if (status === 'pending') pending++;
+        else completed++;
+      });
+      return { pending, completed, rows: rows.reverse() };
+    } catch (err) {
+      console.error('Error loading QC stats:', err);
+      return { pending: 0, completed: 0, rows: [] };
+    }
+  };
+
   const fetchDashboardStats = async () => {
     setStatsLoading(true);
     try {
@@ -234,8 +274,7 @@ export default function Dashboard() {
         tadaRes,
         warehouseRes,
         engineerDropdownRes,
-        { data: receivingRows, error: receivingError },
-        { data: qcRows, error: qcError },
+        qcStats,
       ] = await Promise.all([
         vcTicketIds.length
           ? supabase.from('sss_tickets').select('*').in('ticket_id', vcTicketIds)
@@ -247,9 +286,10 @@ export default function Dashboard() {
         supabase.from('sss_tada').select('*'),
         supabase.from('sss_warehouse').select('*'),
         supabase.from('sss_dropdown').select('value').eq('category', 'engineer_assign_name'),
-        // Material testing data — already on the same Supabase project (ltoSupabase = supabase alias).
-        ltoSupabase.from('pfms_view-receiving_accounts').select('indent_number, lift_no, item_name, received_qty, plan7, actual7'),
-        ltoSupabase.from('pfms_material-testing').select('lift_no, approved_qty, rejected_qty'),
+        // Material testing lives in the separate PFMS project (RLS, no anon policy) —
+        // read through the server-side proxy, never directly. Isolated so a QC
+        // failure can't take the Video Call / Site Visit stats down with it.
+        loadQcStats(),
       ]);
 
       if (vcTicketsRes.error) throw vcTicketsRes.error;
@@ -258,8 +298,6 @@ export default function Dashboard() {
       if (tadaRes.error) throw tadaRes.error;
       if (warehouseRes.error) throw warehouseRes.error;
       if (engineerDropdownRes.error) throw engineerDropdownRes.error;
-      if (receivingError) throw receivingError;
-      if (qcError) throw qcError;
 
       // ---- Video Call pending/solved stats ----
       const latestAttemptByTicket = new Map();
@@ -372,44 +410,7 @@ export default function Dashboard() {
 
       const svHistory = [...siteVisitHistory, ...videoCallHistory, ...repairHistory];
 
-      // ---- Material testing stats (already Supabase-backed, unchanged) ----
-      const approvedMap = new Map();
-      (qcRows || []).forEach((r) => {
-        const liftNo = String(r.lift_no || '').trim().toLowerCase();
-        if (!liftNo) return;
-        approvedMap.set(liftNo, (approvedMap.get(liftNo) || 0) + (parseFloat(r.approved_qty || 0)));
-      });
-
-      let mtPending = 0;
-      let mtCompleted = 0;
-      let mtRows = [];
-      (receivingRows || [])
-        .filter((row) => row.indent_number && String(row.indent_number).trim() !== '')
-        .forEach((row, index) => {
-          const plan7Str = String(row.plan7 || '').trim();
-          const actual7Str = String(row.actual7 || '').trim();
-          let status = 'not_ready';
-          if (plan7Str && plan7Str !== '-') {
-            status = (actual7Str && actual7Str !== '-') ? 'completed' : 'pending';
-          }
-          const liftNo = String(row.lift_no || '').trim();
-          const totalApproved = approvedMap.get(liftNo.toLowerCase()) || 0;
-
-          if (status === 'pending' || status === 'completed') {
-            mtRows.push({
-              id: index + 1,
-              indentNumber: String(row.indent_number || '').trim(),
-              liftNo,
-              itemName: String(row.item_name || '').trim(),
-              receivedQty: row.received_qty || '0',
-              approvedQty: totalApproved,
-              status,
-            });
-            if (status === 'pending') mtPending++;
-            else mtCompleted++;
-          }
-        });
-      mtRows = mtRows.reverse();
+      const { pending: mtPending, completed: mtCompleted, rows: mtRows } = qcStats;
 
       // ---- Engineer filter list for the calendar modal ----
       const engineerNames = [
