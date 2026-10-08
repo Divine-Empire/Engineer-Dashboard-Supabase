@@ -13,9 +13,39 @@ import toast from 'react-hot-toast';
 import { pfmsSupabase } from '../../lib/supabase/pfmsClient';
 
 // Storage: pfms-purchase-fms bucket lives in the PFMS production project
-// (zpkikvgmmbtekbcuqahf), not the LTO project.
-const PFMS_STORAGE_BUCKET = 'pfms-purchase-fms';
-const PFMS_STORAGE_FOLDER = 'general';
+// (zpkikvgmmbtekbcuqahf), not the LTO project. Uploads use one-time signed
+// URLs minted by /api/material-testing (the anon key can't write to it).
+
+// Shrinks phone photos before upload (they go straight to Storage via a signed
+// URL, so this is about storage/bandwidth, not the Vercel body limit). Resizes
+// to max 1600px on the long side and re-encodes as JPEG. Falls back to the
+// original file if anything fails or the result isn't smaller.
+const MAX_IMAGE_DIM = 1600;
+const JPEG_QUALITY = 0.8;
+async function compressImage(file) {
+  try {
+    if (!file.type.startsWith('image/') || file.type === 'image/gif') return file;
+    const bitmap = await createImageBitmap(file);
+    const scale = Math.min(1, MAX_IMAGE_DIM / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close?.();
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', JPEG_QUALITY));
+    if (!blob || blob.size >= file.size) return file;
+    return new File([blob], file.name.replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg' });
+  } catch {
+    return file;
+  }
+}
+
+async function apiRequest(url, options) {
+  const res = await fetch(url, options);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+  return body;
+}
 
 function SearchableSrnDropdown({ value, onChange, options, placeholder }) {
   const [isOpen, setIsOpen] = useState(false);
@@ -116,59 +146,19 @@ export default function MaterialTesting() {
   const loadSales = async () => {
     setFetchLoading(true);
     try {
-      const { data: dropRows, error: dropError } = await pfmsSupabase
-        .from('pfms_dropdown')
-        .select('category, value')
-        .in('category', ['Engineers', 'QC-Checklist', 'Reject Type (QC)']);
-      if (dropError) throw dropError;
-      if (dropRows) {
-        const byCategory = (cat) =>
-          [...new Set(dropRows.filter((r) => r.category === cat).map((r) => r.value).filter(Boolean))];
-        setQcEngineerList(byCategory('Engineers'));
-        setChecklistList(byCategory('QC-Checklist'));
-        setRejectTypeList(byCategory('Reject Type (QC)'));
-      }
+      // Goes through /api/material-testing (service_role, server-side): the PFMS
+      // tables have RLS with no anon policy, so a direct anon-key query here
+      // silently returns zero rows. See api/material-testing.js.
+      const { dropdowns: dropRows, testings, cancelledNos: cancelledList } =
+        await apiRequest('/api/material-testing');
 
-      // Same nested embed Purchase-FMS-Supabase's own GET route uses.
-      const { data: testings, error: testingError } = await pfmsSupabase
-        .from('pfms_material-testing')
-        .select(`
-          *,
-          lift:pfms_lift!inner (
-            liftNo,
-            indent:pfms_indent_generation!inner (
-              indentNo,
-              itemName,
-              category,
-              warehouseLocation,
-              negotiation:pfms_negotiation (
-                selectedVendorName
-              ),
-              poEntry:"pfms_po-entry" (
-                poNumber,
-                basicValue,
-                totalWithTax
-              )
-            ),
-            materialReceived:"pfms_material-received" (
-              invoiceNumber,
-              invoiceDate,
-              receivedQty,
-              damagedQty,
-              damageReason,
-              damageImage,
-              plannedMaterialTesting,
-              timestamp
-            )
-          )
-        `);
-      if (testingError) throw testingError;
+      const byCategory = (cat) =>
+        [...new Set(dropRows.filter((r) => r.category === cat).map((r) => r.value).filter(Boolean))];
+      setQcEngineerList(byCategory('Engineers'));
+      setChecklistList(byCategory('QC-Checklist'));
+      setRejectTypeList(byCategory('Reject Type (QC)'));
 
-      const { data: cancelledList, error: cancelledError } = await pfmsSupabase
-        .from('pfms_order-cancellation')
-        .select('indentNo');
-      if (cancelledError) throw cancelledError;
-      const cancelledNos = new Set((cancelledList || []).map((c) => c.indentNo));
+      const cancelledNos = new Set(cancelledList || []);
 
       const rows = (testings || []).map((testing) => {
         const lift = testing.lift || {};
@@ -458,17 +448,10 @@ function QCFormModal({ isOpen, onClose, record, onSave, qcEngineerList, checklis
     if (record) {
       setSerialsLoading(true);
       const cleanLift = String(record.data.liftNo || '').trim();
-      pfmsSupabase
-        .from('pfms_serial-number')
-        .select('"serialNo"')
-        .eq('liftNo', cleanLift)
-        .then(({ data, error }) => {
-          if (!error && data) {
-            setSerialNoList(data.map((r) => String(r.serialNo || '').trim()).filter(Boolean));
-          }
-          setSerialsLoading(false);
-        })
-        .catch((err) => { console.error('Error loading serials:', err); setSerialsLoading(false); });
+      apiRequest(`/api/material-testing?action=serials&liftNo=${encodeURIComponent(cleanLift)}`)
+        .then(({ serials }) => setSerialNoList(serials || []))
+        .catch((err) => console.error('Error loading serials:', err))
+        .finally(() => setSerialsLoading(false));
       setQcBy(''); setWorkingCondition(''); setApprovedQty('');
       setChecklistSelected([]); setRejectType(''); setPartName('');
       setRejectQty(''); setRemarks(''); setSrnEntries([]); setRejectSrnEntries([]);
@@ -485,13 +468,16 @@ function QCFormModal({ isOpen, onClose, record, onSave, qcEngineerList, checklis
     return false;
   })();
 
-  const uploadImage = async (file, prefix) => {
-    const ext = file.name.split('.').pop();
-    const path = `${PFMS_STORAGE_FOLDER}/${prefix}_${Date.now()}.${ext}`;
-    const { error } = await pfmsSupabase.storage.from(PFMS_STORAGE_BUCKET).upload(path, file, { upsert: false });
+  const uploadImage = async (originalFile, prefix) => {
+    const file = await compressImage(originalFile);
+    const { bucket, path, token, publicUrl } = await apiRequest('/api/material-testing?action=upload-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prefix, fileName: file.name }),
+    });
+    const { error } = await pfmsSupabase.storage.from(bucket).uploadToSignedUrl(path, token, file);
     if (error) throw error;
-    const { data: urlData } = pfmsSupabase.storage.from(PFMS_STORAGE_BUCKET).getPublicUrl(path);
-    return urlData.publicUrl || '';
+    return publicUrl;
   };
 
   const handleSubmit = async (e) => {
@@ -513,50 +499,26 @@ function QCFormModal({ isOpen, onClose, record, onSave, qcEngineerList, checklis
         imageUrlsArr = srnData.map((d) => d.image).filter(Boolean);
       }
 
-      // pfms_material-testing is ONE row per lift, created upstream by
-      // Purchase-FMS-Supabase's material-received stage — UPDATE it in
-      // place (never insert a second row for the same lift, see
-      // loadSales() above / app/api/material-testing/route.ts POST).
-      const { data: currentTesting, error: fetchError } = await pfmsSupabase
-        .from('pfms_material-testing')
-        .select('*')
-        .eq('liftNo', record.data.liftNo)
-        .maybeSingle();
-      if (fetchError) throw fetchError;
-      if (!currentTesting) throw new Error(`Testing record not found for lift ${record.data.liftNo}`);
-
-      const oldApproved = currentTesting.approvedQty || 0;
-      const oldRejected = currentTesting.rejectedQty || 0;
-      const newApproved = oldApproved + (isPassed ? (parseFloat(approvedQty) || 0) : 0);
-      const newRejected = oldRejected + (workingCondition === 'Rejected' ? (parseFloat(rejectQty) || 0) : 0);
-      const receivedQty = parseFloat(record.data.receivedQty || 0);
-      const newPending = Math.max(0, receivedQty - (newApproved + newRejected));
-
-      const newChecklist = Array.from(new Set([...(currentTesting.checklist || []), ...(isPassed ? checklistSelected : [])]));
-      const newSerialNumbers = [...(currentTesting.serialNumbers || []), ...serialNosArr];
-      const newImages = [...(currentTesting.images || []), ...imageUrlsArr];
-      const now = new Date().toISOString();
-
-      const { error: updateError } = await pfmsSupabase
-        .from('pfms_material-testing')
-        .update({
-          timestamp: now,
-          qcBy: qcBy || currentTesting.qcBy,
-          qcDate: qcDate || currentTesting.qcDate,
-          workingCondition: workingCondition || currentTesting.workingCondition,
-          remarks: remarks || currentTesting.remarks,
-          pendingQty: newPending,
-          approvedQty: newApproved,
-          rejectedQty: newRejected,
-          checklist: newChecklist,
-          serialNumbers: newSerialNumbers,
-          images: newImages,
-          rejectType: workingCondition === 'Rejected' ? (rejectType || currentTesting.rejectType) : currentTesting.rejectType,
-          partName: workingCondition === 'Rejected' ? (partName || currentTesting.partName) : currentTesting.partName,
-          updatedAt: now,
-        })
-        .eq('liftNo', record.data.liftNo);
-      if (updateError) throw updateError;
+      // The server UPDATEs the lift's single pfms_material-testing row in place
+      // (accumulating qty/arrays) — see api/material-testing.js submitQc().
+      const { pendingQty: newPending } = await apiRequest('/api/material-testing?action=submit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          liftNo: record.data.liftNo,
+          qcBy,
+          qcDate,
+          workingCondition,
+          remarks,
+          approvedQty: isPassed ? approvedQty : 0,
+          rejectQty: isPassed ? 0 : rejectQty,
+          checklist: isPassed ? checklistSelected : [],
+          serialNumbers: serialNosArr,
+          images: imageUrlsArr,
+          rejectType,
+          partName,
+        }),
+      });
 
       if (newPending <= 0) {
         toast.success('QC Inspection Complete — all quantity resolved!');
