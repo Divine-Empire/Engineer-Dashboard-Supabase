@@ -21,9 +21,18 @@ const INITIAL_COLUMNS = [
   'Phone Number',
   'Machine Name',
   'Mention Issue',
+  'Video Call Remarks',
+  'Engineer Assign',
+  'Enquiry Item List',
   'Call Time',
   'Date',
 ];
+
+// Column visibility rules (on top of the user's own Columns toggle):
+//  - Remarks (the video-call attempt's own remarks) exists only on History.
+//  - Engineer Assign is admin-role only (both tabs); Enquiry Item List is for everyone.
+const HISTORY_ONLY_COLUMNS = ['Video Call Remarks'];
+const ADMIN_ONLY_COLUMNS = ['Engineer Assign'];
 
 const ALL_COLUMNS = [
   'Ticket-ID',
@@ -32,6 +41,9 @@ const ALL_COLUMNS = [
   'Phone Number',
   'Machine Name',
   'Mention Issue',
+  'Video Call Remarks',
+  'Engineer Assign',
+  'Enquiry Item List',
   'Call Time',
   'Date',
   'Source of enquiry',
@@ -99,6 +111,15 @@ const formatCallTime = (timeStr) => {
   return str;
 };
 
+function getStoredRole() {
+  try {
+    const raw = localStorage.getItem("o2d-auth-storage");
+    return raw ? JSON.parse(raw)?.state?.user?.role || "" : "";
+  } catch {
+    return "";
+  }
+}
+
 export default function VideoCall() {
   const [sales, setSales] = useState([]); // using 'sales' to keep naming consistent with pagination state
   const [searchTerm, setSearchTerm] = useState('');
@@ -131,9 +152,22 @@ export default function VideoCall() {
     };
   }, [isDropdownOpen]);
 
+  const isAdmin = getStoredRole() === 'admin';
+
+  // Columns this user/tab may see at all (also what the Columns dropdown lists).
+  const availableColumns = useMemo(
+    () =>
+      ALL_COLUMNS.filter((col) => {
+        if (ADMIN_ONLY_COLUMNS.includes(col) && !isAdmin) return false;
+        if (HISTORY_ONLY_COLUMNS.includes(col) && activeTab !== 'history') return false;
+        return true;
+      }),
+    [isAdmin, activeTab]
+  );
+
   const activeColumns = useMemo(() => {
-    return ALL_COLUMNS.filter(col => selectedColumns.includes(col));
-  }, [selectedColumns]);
+    return availableColumns.filter(col => selectedColumns.includes(col));
+  }, [availableColumns, selectedColumns]);
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [selectedLocation, setSelectedLocation] = useState('all');
 
@@ -192,6 +226,7 @@ export default function VideoCall() {
           clientType: String(t.client_type || "").trim(),
           gstNo: String(t.gst_no || "").trim(),
           mentionIssue: String(t.mention_issue || "").trim(),
+          enquiryItemList: String(t.enquiry_item_list || "").trim(),
           machineName: String(t.machine_name || "").trim(),
           enquiryType: String(t.enquiry_type || "").trim(),
           siteName: String(t.site_address || "").trim(),
@@ -397,7 +432,7 @@ export default function VideoCall() {
                 <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider px-2 py-1 border-b border-slate-100 mb-1">
                   Visible Columns
                 </div>
-                {ALL_COLUMNS.map((col) => {
+                {availableColumns.map((col) => {
                   const isChecked = selectedColumns.includes(col);
                   return (
                     <label
@@ -535,6 +570,27 @@ export default function VideoCall() {
                     </div>
                   )}
 
+                  {activeColumns.includes('Video Call Remarks') && ticket.remarks && (
+                    <div className="pt-1">
+                      <p className="text-slate-500 font-medium">Video Call Remarks</p>
+                      <p className="text-slate-700">{ticket.remarks}</p>
+                    </div>
+                  )}
+
+                  {activeColumns.includes('Engineer Assign') && ticket.engineerAssign && (
+                    <div className="pt-1">
+                      <p className="text-slate-500 font-medium">Engineer Assign</p>
+                      <p className="text-slate-700">{ticket.engineerAssign}</p>
+                    </div>
+                  )}
+
+                  {activeColumns.includes('Enquiry Item List') && ticket.enquiryItemList && (
+                    <div className="pt-1">
+                      <p className="text-slate-500 font-medium">Enquiry Item List</p>
+                      <a href={ticket.enquiryItemList} target="_blank" rel="noreferrer" className="text-indigo-600 underline font-semibold">View</a>
+                    </div>
+                  )}
+
                   {activeColumns.includes('GST Address') && ticket.gstAddress && (
                     <div className="pt-1 bg-slate-50 p-2 rounded-lg">
                       <p className="text-slate-500 font-medium text-[10px]">GST Address</p>
@@ -639,7 +695,7 @@ export default function VideoCall() {
                     );
                   case 'Site Address':
                     return (
-                      <td key="Site Address" className="px-5 py-3.5 text-xs text-slate-600">
+                      <td key="Site Address" className="px-5 py-3.5 text-xs text-slate-600 max-w-[220px] truncate" title={ticket.siteAddress}>
                         {ticket.siteAddress}
                       </td>
                     );
@@ -665,6 +721,30 @@ export default function VideoCall() {
                     return (
                       <td key="Mention Issue" className="px-5 py-3.5 text-xs text-slate-600 max-w-[200px] truncate" title={ticket.mentionIssue}>
                         {ticket.mentionIssue}
+                      </td>
+                    );
+                  case 'Video Call Remarks':
+                    return (
+                      <td key="Video Call Remarks" className="px-5 py-3.5 text-xs text-slate-600 max-w-[220px] truncate" title={ticket.remarks}>
+                        {ticket.remarks}
+                      </td>
+                    );
+                  case 'Engineer Assign':
+                    return (
+                      <td key="Engineer Assign" className="px-5 py-3.5 text-xs text-slate-600 whitespace-nowrap">
+                        {ticket.engineerAssign}
+                      </td>
+                    );
+                  case 'Enquiry Item List':
+                    return (
+                      <td key="Enquiry Item List" className="px-5 py-3.5 text-xs text-slate-600">
+                        {ticket.enquiryItemList ? (
+                          <a href={ticket.enquiryItemList} target="_blank" rel="noreferrer" className="text-indigo-600 underline hover:text-indigo-800 font-semibold">
+                            View
+                          </a>
+                        ) : (
+                          '-'
+                        )}
                       </td>
                     );
                   case 'Call Time':
