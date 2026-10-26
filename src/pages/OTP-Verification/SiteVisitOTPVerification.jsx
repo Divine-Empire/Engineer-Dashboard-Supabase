@@ -1,18 +1,7 @@
-import { useState, useEffect } from "react";
-import {
-  Card,
-  CardContent,
-  CardHeader,
-} from "../../components/ui/card";
+import { useState, useEffect, useMemo } from "react";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
-import {
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from "../../components/ui/tabs";
 import {
   Select,
   SelectContent,
@@ -22,16 +11,120 @@ import {
 } from "../../components/ui/select";
 import { Modal } from "../../components/ui/modal";
 import { useToast } from "../../hooks/use-toast";
-import { Loader2Icon, LoaderIcon } from "lucide-react";
+import { Loader2Icon, LoaderIcon, RefreshCw, ShieldCheck } from "lucide-react";
 import { supabase } from "../../lib/supabase/client";
+import { StatusTabs, FilterSearch, FilterChips, ColumnSelector, DataTable, StatusBadge, filterControlClass } from "../../components/shared";
+import formatDisplayDate from "../../utils/formatDate";
+import { useAuthStore } from "../../store/authStore";
+import { useStageList, PAGE_SIZES } from "../../hooks/use-stage-list";
+import { scopeBy } from "../../lib/pagedView";
+
+// Pending / History come from flat SQL views (Database/05_otp_verification_views.sql):
+// search, filters, engineer scope and counts run in SQL, one page per request.
+//   Pending = no sss_otp_verification row yet; History = a row exists.
+const VIEWS = { pending: "engg_v_otp_verification_pending", history: "engg_v_otp_verification_history" };
+const ORDER = {
+  pending: [{ column: "created_at", ascending: false }],
+  history: [{ column: "created_at", ascending: false }],
+};
+const ALL_COLUMNS = [
+  { key: "timeStemp", label: "Date" },
+  { key: "ticketId", label: "Ticket ID" },
+  { key: "clientName", label: "Client Name" },
+  { key: "companyName", label: "Company Name", tabs: ["pending"] },
+  { key: "phoneNumber", label: "Phone Number" },
+  { key: "machineName", label: "Machine Name", tabs: ["pending"] },
+  { key: "engineerAssign", label: "Engineer Assign", tabs: ["pending"] },
+  { key: "travelDate", label: "Travel Date", tabs: ["pending"] },
+  { key: "returnDate", label: "Return Date", tabs: ["pending"] },
+  { key: "siteVisitDate", label: "Site Visit Date", tabs: ["history"] },
+  { key: "status", label: "Verification Status", tabs: ["history"] },
+  { key: "serviceReportFile", label: "Service Report", tabs: ["history"] },
+  { key: "remarks", label: "Remarks", tabs: ["history"] },
+  { key: "quatationReceive", label: "Quotation Receive", tabs: ["history"] },
+  { key: "video", label: "Video", tabs: ["history"] },
+  { key: "locallyPurchasedSpares", label: "Locally Purchased Spares", tabs: ["history"] },
+  { key: "delay", label: "Delay", tabs: ["history"] },
+];
+const DATE_KEYS = ["timeStemp", "travelDate", "returnDate", "siteVisitDate"];
+const LINK_KEYS = ["serviceReportFile", "quatationReceive", "video"];
+
+// View row -> the shape the row renderers and the verification form already use.
+// `ticketUuid` = the ticket uuid (the form submits against it).
+const mapRow = (r) => ({
+  ticketId: r.ticket_id,
+  ticketUuid: r.id,
+  timeStemp: r.created_at || "",
+  clientName: r.client_name || "",
+  companyName: r.company_name || "",
+  phoneNumber: r.phone_number || "",
+  machineName: r.machine_name || "",
+  engineerAssign: r.engineer_assign || "",
+  CREName: r.cre_name || "",
+  travelDate: r.travel_date || "",
+  returnDate: r.return_date || "",
+  siteVisitOtp: r.site_visit_otp || "",
+  siteVisitDate: r.site_visit_date || "",
+  otpVerification: r.otp_entered || "",
+  serviceReportFile: r.service_report_file || "",
+  quatationReceive: r.quotation_receive_file || "",
+  video: r.video_link || "",
+  locallyPurchasedSpares: r.locally_purchased_spares || "",
+  remarks: r.remarks || "",
+  delayMinutes: r.delay_minutes,
+});
+
+// Minutes late, always >= 0 (or "-" when no delay was computed).
+const delayText = (m) => (m === null || m === undefined ? "-" : `${m} min`);
+
+function cellText(key, t) {
+  if (DATE_KEYS.includes(key)) return t[key] ? formatDisplayDate(t[key]) : "";
+  if (key === "delay") return delayText(t.delayMinutes);
+  return t[key] || "";
+}
+
+function renderCell(key, t) {
+  if (key === "ticketId") {
+    return (
+      <td key={key} className="px-3.5 py-2 whitespace-nowrap align-middle">
+        <span className="rounded bg-secondary px-1.5 py-0.5 font-mono text-xs font-semibold text-foreground">{t.ticketId}</span>
+      </td>
+    );
+  }
+  if (key === "status") {
+    return <td key={key} className="px-3.5 py-2 align-middle"><StatusBadge tone="success">Verified</StatusBadge></td>;
+  }
+  if (key === "delay") {
+    return (
+      <td key={key} className="px-3.5 py-2 align-middle">
+        <StatusBadge tone={t.delayMinutes > 0 ? "danger" : "success"}>{delayText(t.delayMinutes)}</StatusBadge>
+      </td>
+    );
+  }
+  if (LINK_KEYS.includes(key)) {
+    return (
+      <td key={key} className="px-3.5 py-2 text-xs align-middle">
+        {t[key] ? (
+          <a href={t[key]} target="_blank" rel="noopener noreferrer" className="font-semibold text-primary underline hover:text-brand-800">View</a>
+        ) : (
+          "-"
+        )}
+      </td>
+    );
+  }
+  const text = cellText(key, t) || "-";
+  return (
+    <td key={key} className={`px-3.5 py-2 text-xs text-foreground align-middle ${key === "clientName" ? "font-semibold" : ""}`}>
+      <div className="max-w-[240px] truncate" title={text}>{text}</div>
+    </td>
+  );
+}
 
 export default function SiteVisitOTPVerification() {
   const [lastOtpGenerations, setLastOtpGenerations] = useState({});
-  const [activeTab, setActiveTab] = useState("pending");
   const [showApprovalModal, setShowApprovalModal] = useState(false);
   const [selectedTicket, setSelectedTicket] = useState(null);
   const [formData, setFormData] = useState({});
-  const [searchItem, setSearchItem] = useState("");
   // Files are only HELD here on selection — actual upload happens at submit
   // time in handleSubmit (all three in parallel), so cancelling the form or
   // switching tickets never leaves an orphaned upload behind, and nothing
@@ -41,108 +134,30 @@ export default function SiteVisitOTPVerification() {
   const [videoFile, setVideoFile] = useState(null);
   const { toast } = useToast();
 
-  const [pendingData, setPendingData] = useState([]);
-  const [historyData, setHistoryData] = useState([]);
-  const [fetchLoading, setFetchLoading] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const fetchData = async () => {
-    setFetchLoading(true);
-    try {
-      // Tickets ready for OTP Verification (tada.otp_verification_planned set).
-      const { data: tadaRows, error: tadaError } = await supabase
-        .from("sss_tada")
-        .select("ticket_id, ticket_uuid, travel_date, return_date, otp_verification_planned")
-        .not("otp_verification_planned", "is", null)
-        .order("created_at", { ascending: false });
+  const { user } = useAuthStore();
 
-      if (tadaError) throw tadaError;
-
-      const ticketIds = [...new Set((tadaRows || []).map((t) => t.ticket_id))];
-
-      if (ticketIds.length === 0) {
-        setPendingData([]);
-        setHistoryData([]);
-        return;
-      }
-
-      const tadaByTicket = new Map((tadaRows || []).map((t) => [t.ticket_id, t]));
-
-      const { data: ticketsData, error: ticketsError } = await supabase
-        .from("sss_tickets")
-        .select("*")
-        .in("ticket_id", ticketIds)
-        .order("created_at", { ascending: true });
-
-      if (ticketsError) throw ticketsError;
-
-      const { data: otpRows, error: otpError } = await supabase
-        .from("sss_otp_verification")
-        .select("*")
-        .in("ticket_id", ticketIds);
-
-      if (otpError) throw otpError;
-
-      const otpByTicket = new Map((otpRows || []).map((o) => [o.ticket_id, o]));
-
-      const pending = [];
-      const history = [];
-
-      (ticketsData || []).forEach((t) => {
-        const tada = tadaByTicket.get(t.ticket_id);
-
-        const base = {
-          ticketId: t.ticket_id,
-          ticketUuid: t.uuid,
-          timeStemp: t.created_at || "",
-          clientName: t.client_name || "",
-          companyName: t.company_name || "",
-          phoneNumber: t.phone_number || "",
-          machineName: t.machine_name || "",
-          engineerAssign: t.engineer_assign || "",
-          CREName: t.cre_name || "",
-          travelDate: tada?.travel_date || "",
-          returnDate: tada?.return_date || "",
-          // Live/regeneratable OTP for this stage (tickets.site_visit_otp,
-          // migration 0032) — separate from tickets.otp (Video-Call's own).
-          siteVisitOtp: t.site_visit_otp || "",
-        };
-
-        const otp = otpByTicket.get(t.ticket_id);
-        if (otp) {
-          history.push({
-            ...base,
-            siteVisitDate: otp.site_visit_date || "",
-            otpVerification: otp.otp_entered || "",
-            serviceReportFile: otp.service_report_file || "",
-            quatationReceive: otp.quotation_receive_file || "",
-            video: otp.video_link || "",
-            locallyPurchasedSpares: otp.locally_purchased_spares || "",
-            remarks: otp.remarks || "",
-            delayMinutes: otp.delay_minutes,
-          });
-        } else {
-          pending.push(base);
-        }
-      });
-
-      setPendingData(pending);
-      setHistoryData(history);
-    } catch (error) {
-      console.error("Error fetching data:", error);
-      toast({
-        title: "Error",
-        description: "Failed to load data",
-        variant: "destructive",
-      });
-    } finally {
-      setFetchLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchData();
-  }, []);
+  // Engineers only see tickets assigned to them; admins see everything (and get an Engineer filter).
+  const isEngineer = user?.role === "ENGINEER";
+  const isAdmin = user?.role === "ADMIN";
+  const scope = useMemo(
+    () => (isEngineer ? scopeBy(["engineer_assign"], [user?.name, user?.id]) : null),
+    [isEngineer, user?.name, user?.id]
+  );
+  const filters = useMemo(
+    () => (isAdmin ? [{ key: "engineer", column: "engineer_assign", label: "Engineer", allLabel: "All Engineers" }] : []),
+    [isAdmin]
+  );
+  const list = useStageList({
+    key: "otp-verification",
+    views: VIEWS,
+    scope,
+    scopeKey: isEngineer ? `eng:${user?.id}` : "all",
+    filters,
+    columns: ALL_COLUMNS,
+    order: ORDER,
+  });
 
   const handleApprovalClick = (ticket) => {
     setSelectedTicket(ticket);
@@ -282,7 +297,7 @@ export default function SiteVisitOTPVerification() {
       });
 
       setShowApprovalModal(false);
-      fetchData();
+      list.reload();
     } catch (error) {
       console.error("Error submitting ticket:", error);
       toast({
@@ -404,604 +419,121 @@ export default function SiteVisitOTPVerification() {
     return `${day}/${month}/${year}`;
   };
 
-  // Minutes late, always >= 0 (or blank when no delay was computed). See
-  // otp_verification.delay_minutes / migration 0032 — same non-negative
-  // convention as tada.delay_minutes.
-  const formatDelay = (minutes) => {
-    if (minutes === null || minutes === undefined) return "-";
-    return `${minutes} min`;
-  };
-
-  const filteredPendingDataa = pendingData
-    .filter((item) => {
-      const phoneNumberStr = String(item.phoneNumber || "");
-      return (
-        item.ticketId?.toLowerCase().includes(searchItem.toLowerCase()) ||
-        item.clientName?.toLowerCase().includes(searchItem.toLowerCase()) ||
-        item.companyName?.toLowerCase().includes(searchItem.toLowerCase()) ||
-        phoneNumberStr?.toLowerCase().includes(searchItem.toLowerCase())
-      );
-    })
-    .reverse();
-
-  const filteredHistoryDataa = historyData
-    .filter((item) => {
-      const phoneNumberStr = String(item.phoneNumber || "");
-      return (
-        item.ticketId?.toLowerCase().includes(searchItem.toLowerCase()) ||
-        item.clientName?.toLowerCase().includes(searchItem.toLowerCase()) ||
-        item.companyName?.toLowerCase().includes(searchItem.toLowerCase()) ||
-        phoneNumberStr?.toLowerCase().includes(searchItem.toLowerCase())
-      );
-    })
-    .reverse();
-
-  const userName = localStorage.getItem("currentUsername");
-
-  const roleStorage = localStorage.getItem("o2d-auth-storage");
-  const parsedData = JSON.parse(roleStorage);
-  const role = parsedData.state.user.role;
-
-  const filteredPendingData = role === "user" ? filteredPendingDataa.filter(
-    (item) => item["CREName"] === userName
-  ) : role === "engineer" ? filteredPendingDataa.filter((item) => item["engineerAssign"] === userName) : filteredPendingDataa;
-
-  const filteredHistoryData = role === "user" ? filteredHistoryDataa.filter(
-    (item) => item["CREName"] === userName
-  ) : role === 'engineer' ? filteredHistoryDataa.filter((item) => item["engineerAssign"] === userName) : filteredHistoryDataa;
+  const isPending = list.tab === "pending";
+  const rows = useMemo(() => list.rows.map(mapRow), [list.rows]);
+  const headers = [...(isPending ? [{ label: "Action", className: "w-24" }] : []), ...list.activeColumns.map((c) => c.label)];
 
   return (
-    <div className="space-y-2">
-      <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-        <Card className="border-0 shadow-lg bg-gradient-to-br from-blue-50 to-indigo-50">
-          <CardHeader className="bg-gradient-to-r from-blue-50/50 to-indigo-50/50 rounded-t-lg border-b border-blue-100 px-6 py-4 flex flex-col md:flex-row justify-between items-center gap-4">
-            <div className="flex flex-wrap items-center gap-4">
-              <TabsList className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200">
-                <TabsTrigger
-                  value="pending"
-                  data-testid="tab-pending"
-                  className="data-[state=active]:bg-blue-600 data-[state=active]:text-white"
-                >
-                  Pending ({filteredPendingData.length})
-                </TabsTrigger>
-                <TabsTrigger
-                  value="history"
-                  data-testid="tab-history"
-                  className="data-[state=active]:bg-blue-600 data-[state=active]:text-white"
-                >
-                  History ({filteredHistoryData.length})
-                </TabsTrigger>
-              </TabsList>
-            </div>
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      {/* One toolbar row */}
+      <div className="flex flex-wrap items-center gap-2">
+        <StatusTabs tabs={list.tabs} activeTab={list.tab} onChange={list.setTab} label="OTP verification views" />
+        <FilterSearch
+          value={list.search}
+          onChange={list.setSearch}
+          placeholder="Search ticket, client, company, phone..."
+          className="min-w-[220px] flex-1"
+        />
+        {filters.map((f) => (
+          <select
+            key={f.key}
+            aria-label={f.label}
+            value={list.filterValues[f.key]}
+            onChange={(e) => list.setFilter(f.key, e.target.value)}
+            className={`${filterControlClass} !w-auto min-w-[140px] max-w-[200px]`}
+          >
+            <option value="all">{f.allLabel}</option>
+            {list.filterOptions[f.key].map((v) => (
+              <option key={v} value={v}>{v}</option>
+            ))}
+          </select>
+        ))}
+        <button
+          type="button"
+          onClick={list.reload}
+          disabled={list.fetching}
+          aria-label="Refresh"
+          className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-input bg-card text-sm text-foreground transition-colors hover:bg-accent disabled:opacity-50"
+        >
+          <RefreshCw className={`h-4 w-4 ${list.fetching ? "animate-spin" : ""}`} aria-hidden="true" />
+        </button>
+        <ColumnSelector {...list.columnPanel} />
+      </div>
+      <FilterChips chips={list.chips} onClearAll={list.clearAll} />
 
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-4 flex-1 md:justify-end w-full md:w-auto">
-              <div className="relative flex-1 max-w-md w-full">
-                <Input
-                  id="searchFilter"
-                  placeholder="Search by ticket ID, client, company or phone..."
-                  className="pl-10 py-2 w-full rounded-md border-blue-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 bg-white"
-                  data-testid="input-search-filter"
-                  onChange={(e) => setSearchItem(e.target.value)}
-                />
+      <div className="min-h-0 flex-1">
+        <DataTable
+          ariaLabel={isPending ? "Pending OTP verifications" : "OTP verification history"}
+          headers={headers}
+          data={rows}
+          loading={list.loading}
+          error={list.error}
+          onRetry={list.reload}
+          emptyTitle={list.chips.length ? "No tickets match these filters" : isPending ? "No pending site visit verifications" : "No verification history yet"}
+          currentPage={list.page}
+          totalPages={list.totalPages}
+          itemsPerPage={list.pageSize}
+          totalResults={list.total}
+          onPageChange={list.setPage}
+          onItemsPerPageChange={list.setPageSize}
+          itemsPerPageOptions={PAGE_SIZES}
+          minWidth="min-w-[800px]"
+          renderRow={(ticket) => (
+            <tr key={ticket.ticketUuid}>
+              {isPending && (
+                <td className="px-3.5 py-2 align-middle">
+                  <button
+                    type="button"
+                    onClick={() => handleApprovalClick(ticket)}
+                    data-testid={`button-approval-${ticket.ticketId}`}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
+                  >
+                    <ShieldCheck size={13} aria-hidden="true" />
+                    Verify
+                  </button>
+                </td>
+              )}
+              {list.activeColumns.map((c) => renderCell(c.key, ticket))}
+            </tr>
+          )}
+          renderCard={(ticket) => (
+            <div key={ticket.ticketUuid} className="space-y-2 rounded-lg border bg-card p-3 text-xs shadow-sm">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <span className="rounded bg-secondary px-1.5 py-0.5 font-mono font-semibold">{ticket.ticketId}</span>
+                  <p className="mt-1 text-muted-foreground">{formatDisplayDate(ticket.timeStemp)}</p>
+                </div>
+                {isPending && (
+                  <button
+                    type="button"
+                    onClick={() => handleApprovalClick(ticket)}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 font-semibold text-primary-foreground"
+                  >
+                    <ShieldCheck size={13} aria-hidden="true" />
+                    Verify
+                  </button>
+                )}
               </div>
-            </div>
-          </CardHeader>
-
-          <CardContent>
-            <div className="mt-2">
-              <TabsContent value="pending" className="mt-0">
-                <div className="relative overflow-x-auto">
-                  <div className="max-h-[calc(103vh-200px)] overflow-y-auto">
-                    <table className="hidden sm:block w-full">
-                      <thead className="sticky top-0 z-10">
-                        <tr className="bg-gradient-to-r from-blue-600 to-indigo-600">
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[120px] sticky top-0">
-                            Action
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                            Date
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[120px] sticky top-0">
-                            Ticket ID
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                            Client Name
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[200px] sticky top-0">
-                            Company Name
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                            Phone Number
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                            Machine Name
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                            Engineer Assign
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[120px] sticky top-0">
-                            Travel Date
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[120px] sticky top-0">
-                            Return Date
-                          </th>
-                        </tr>
-                      </thead>
-                      <tbody className="bg-white divide-y divide-blue-100">
-                        {filteredPendingData.length === 0 ? (
-                          <tr>
-                            <td
-                              colSpan={10}
-                              className="text-center py-8 bg-white"
-                              data-testid="text-no-pending"
-                            >
-                              {fetchLoading ? (
-                                <div className="flex justify-center items-center text-blue-700">
-                                  <LoaderIcon className="animate-spin w-8 h-8" />
-                                </div>
-                              ) : (
-                                <h1 className="text-blue-700">
-                                  No pending site visit verifications found.
-                                </h1>
-                              )}
-                            </td>
-                          </tr>
+              <dl className="grid grid-cols-2 gap-x-3 gap-y-2 border-t pt-2">
+                {list.activeColumns
+                  .filter((c) => !["ticketId", "timeStemp"].includes(c.key) && cellText(c.key, ticket))
+                  .map((c) => (
+                    <div key={c.key} className={["remarks", "locallyPurchasedSpares"].includes(c.key) ? "col-span-2" : ""}>
+                      <dt className="text-muted-foreground">{c.label}</dt>
+                      <dd className="break-words font-medium">
+                        {LINK_KEYS.includes(c.key) ? (
+                          <a href={ticket[c.key]} target="_blank" rel="noopener noreferrer" className="font-semibold text-primary underline">View</a>
                         ) : (
-                          filteredPendingData.map((ticket, ind) => (
-                            <tr
-                              key={ticket.ticketId}
-                              className={
-                                ind % 2 === 0 ? "bg-blue-50/50" : "bg-white"
-                              }
-                            >
-                              <td className="px-4 py-3">
-                                <Button
-                                  size="sm"
-                                  onClick={() => handleApprovalClick(ticket)}
-                                  variant="outline"
-                                  className="bg-gradient-to-br from-blue-50 to-indigo-50 text-blue-600 hover:from-blue-100 hover:to-indigo-100 hover:text-blue-700 transition-all duration-300 border border-blue-200 hover:border-blue-300 rounded-lg px-3 py-1.5 shadow-sm hover:shadow-md group"
-                                  data-testid={`button-approval-${ticket.ticketId}`}
-                                >
-                                  <span className="font-medium">Verify</span>
-                                </Button>
-                              </td>
-                              <td className="px-4 py-3 text-blue-900">
-                                {formatDate(ticket.timeStemp)}
-                              </td>
-                              <td className="px-4 py-3 font-medium text-blue-800">
-                                {ticket.ticketId}
-                              </td>
-                              <td className="px-4 py-3 text-blue-900">
-                                {ticket.clientName}
-                              </td>
-                              <td className="px-4 py-3 text-blue-900">
-                                {ticket.companyName || "-"}
-                              </td>
-                              <td className="px-4 py-3 text-blue-900">
-                                {ticket.phoneNumber}
-                              </td>
-                              <td className="px-4 py-3 text-blue-900">
-                                {ticket.machineName || ""}
-                              </td>
-                              <td className="px-4 py-3 text-blue-900">
-                                {ticket.engineerAssign || ""}
-                              </td>
-                              <td className="px-4 py-3 text-blue-900">
-                                {formatDate(ticket.travelDate) || ""}
-                              </td>
-                              <td className="px-4 py-3 text-blue-900">
-                                {formatDate(ticket.returnDate) || ""}
-                              </td>
-                            </tr>
-                          ))
+                          cellText(c.key, ticket)
                         )}
-                      </tbody>
-                    </table>
-
-                    {/* Mobile Card View */}
-                    <div className="sm:hidden space-y-4">
-                      {filteredPendingData.length === 0 ? (
-                        <div
-                          className="text-center py-8 bg-white"
-                          data-testid="text-no-pending"
-                        >
-                          {fetchLoading ? (
-                            <div className="flex justify-center items-center text-blue-700">
-                              <LoaderIcon className="animate-spin w-8 h-8" />
-                            </div>
-                          ) : (
-                            <h1 className="text-blue-700">
-                              No pending site visit verifications found.
-                            </h1>
-                          )}
-                        </div>
-                      ) : (
-                        filteredPendingData.map((ticket, ind) => (
-                          <Card
-                            key={ticket.ticketId}
-                            className={`${ind % 2 === 0 ? "bg-blue-50/50" : "bg-white"
-                              } border-l-4 border-l-blue-500`}
-                          >
-                            <CardContent className="p-4 space-y-3">
-                              <div className="flex justify-between items-start">
-                                <div>
-                                  <h3 className="font-bold text-blue-800 text-lg">
-                                    {ticket.ticketId}
-                                  </h3>
-                                  <p className="text-sm text-gray-600">
-                                    {ticket.clientName}
-                                  </p>
-                                  <p className="text-sm text-gray-600 font-medium">
-                                    Company: {ticket.companyName || "N/A"}
-                                  </p>
-                                </div>
-                                <Button
-                                  size="sm"
-                                  onClick={() => handleApprovalClick(ticket)}
-                                  variant="outline"
-                                  className="bg-gradient-to-br from-blue-50 to-indigo-50 text-blue-600 hover:from-blue-100 hover:to-indigo-100 border border-blue-200"
-                                >
-                                  Verify
-                                </Button>
-                              </div>
-
-                              <div className="grid grid-cols-2 gap-3 text-sm">
-                                <div>
-                                  <p className="text-gray-500 font-medium">
-                                    Phone
-                                  </p>
-                                  <p className="text-blue-900">
-                                    {ticket.phoneNumber}
-                                  </p>
-                                </div>
-                                <div>
-                                  <p className="text-gray-500 font-medium">
-                                    Machine
-                                  </p>
-                                  <p className="text-blue-900">
-                                    {ticket.machineName || "N/A"}
-                                  </p>
-                                </div>
-                              </div>
-
-                              <div className="grid grid-cols-2 gap-3 text-sm">
-                                <div>
-                                  <p className="text-gray-500 font-medium">
-                                    Engineer
-                                  </p>
-                                  <p className="text-blue-900">
-                                    {ticket.engineerAssign || "N/A"}
-                                  </p>
-                                </div>
-                                <div>
-                                  <p className="text-gray-500 font-medium">
-                                    Travel Date
-                                  </p>
-                                  <p className="text-blue-900">
-                                    {formatDate(ticket.travelDate) || "N/A"}
-                                  </p>
-                                </div>
-                              </div>
-                            </CardContent>
-                          </Card>
-                        ))
-                      )}
+                      </dd>
                     </div>
-                  </div>
-                </div>
-              </TabsContent>
-
-              <TabsContent value="history" className="mt-0">
-                <div className="relative overflow-x-auto">
-                  <div className="max-h-[calc(103vh-200px)] overflow-y-auto">
-                    <table className="hidden sm:block w-full">
-                      <thead className="sticky top-0 z-10">
-                        <tr className="bg-gradient-to-r from-blue-600 to-indigo-600">
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                            Date
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[120px] sticky top-0">
-                            Ticket ID
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                            Client Name
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                            Phone Number
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                            Site Visit Date
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                            Verification Status
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                            Service Report
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                            Remarks
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                            Quatation Receive
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[120px] sticky top-0">
-                            Video
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[180px] sticky top-0">
-                            Locally Purchased Spares
-                          </th>
-                          <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[120px] sticky top-0">
-                            Delay
-                          </th>
-                        </tr>
-                      </thead>
-                      <tbody className="bg-white divide-y divide-blue-100">
-                        {filteredHistoryData.length === 0 ? (
-                          <tr>
-                            <td
-                              colSpan={12}
-                              className="text-center py-8 bg-white"
-                              data-testid="text-no-history"
-                            >
-                              {fetchLoading ? (
-                                <div className="flex justify-center items-center text-blue-700">
-                                  <LoaderIcon className="animate-spin w-8 h-8" />
-                                </div>
-                              ) : (
-                                <h1 className="text-blue-700">
-                                  No site visit verification history found.
-                                </h1>
-                              )}
-                            </td>
-                          </tr>
-                        ) : (
-                          filteredHistoryData.map((ticket, ind) => (
-                            <tr
-                              key={ind}
-                              className={
-                                ind % 2 === 0 ? "bg-blue-50/50" : "bg-white"
-                              }
-                            >
-                              <td className="px-4 py-3 text-blue-900">
-                                {formatDate(ticket.timeStemp)}
-                              </td>
-                              <td className="px-4 py-3 font-medium text-blue-800">
-                                {ticket.ticketId}
-                              </td>
-                              <td className="px-4 py-3 text-blue-900">
-                                {ticket.clientName}
-                              </td>
-                              <td className="px-4 py-3 text-blue-900">
-                                {ticket.phoneNumber}
-                              </td>
-                              <td className="px-4 py-3 text-blue-900">
-                                {formatDate(ticket.siteVisitDate) || ""}
-                              </td>
-                              <td className="px-4 py-3">
-                                <span className="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
-                                  Verified
-                                </span>
-                              </td>
-                              <td className="px-4 py-3">
-                                {ticket.serviceReportFile ? (
-                                  <a
-                                    href={ticket.serviceReportFile}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="text-blue-600 hover:text-blue-800 text-xs font-semibold"
-                                  >
-                                    View
-                                  </a>
-                                ) : (
-                                  ""
-                                )}
-                              </td>
-                              <td className="px-4 py-3 text-blue-900">
-                                {ticket.remarks || ""}
-                              </td>
-                              <td className="px-4 py-3">
-                                {ticket.quatationReceive ? (
-                                  <a
-                                    href={ticket.quatationReceive}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="text-blue-600 hover:text-blue-800 text-xs font-semibold"
-                                  >
-                                    View
-                                  </a>
-                                ) : (
-                                  ""
-                                )}
-                              </td>
-                              <td className="px-4 py-3">
-                                {ticket.video ? (
-                                  <a
-                                    href={ticket.video}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="text-blue-600 hover:text-blue-800 text-xs font-semibold"
-                                  >
-                                    View
-                                  </a>
-                                ) : (
-                                  ""
-                                )}
-                              </td>
-                              <td className="px-4 py-3 text-blue-900">
-                                {ticket.locallyPurchasedSpares || ""}
-                              </td>
-                              <td className="px-4 py-3">
-                                <span
-                                  className={`px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${
-                                    ticket.delayMinutes > 0
-                                      ? "bg-red-100 text-red-800"
-                                      : "bg-emerald-100 text-emerald-800"
-                                  }`}
-                                >
-                                  {formatDelay(ticket.delayMinutes)}
-                                </span>
-                              </td>
-                            </tr>
-                          ))
-                        )}
-                      </tbody>
-                    </table>
-
-                    {/* Mobile Card View */}
-                    <div className="sm:hidden space-y-4">
-                      {filteredHistoryData.length === 0 ? (
-                        <div
-                          className="text-center py-8 bg-white"
-                          data-testid="text-no-history"
-                        >
-                          {fetchLoading ? (
-                            <div className="flex justify-center items-center text-blue-700">
-                              <LoaderIcon className="animate-spin w-8 h-8" />
-                            </div>
-                          ) : (
-                            <h1 className="text-blue-700">
-                              No site visit verification history found.
-                            </h1>
-                          )}
-                        </div>
-                      ) : (
-                        filteredHistoryData.map((ticket, ind) => (
-                          <Card
-                            key={ind}
-                            className={`${ind % 2 === 0 ? "bg-blue-50/50" : "bg-white"
-                              } border-l-4 border-l-blue-500`}
-                          >
-                            <CardContent className="p-4 space-y-3">
-                              <div>
-                                <h3 className="font-bold text-blue-800 text-lg">
-                                  {ticket.ticketId}
-                                </h3>
-                                <p className="text-sm text-gray-600">
-                                  {ticket.clientName}
-                                </p>
-                              </div>
-
-                              <div className="grid grid-cols-2 gap-3 text-sm">
-                                <div>
-                                  <p className="text-gray-500 font-medium">
-                                    Site Visit Date
-                                  </p>
-                                  <p className="text-blue-900">
-                                    {formatDate(ticket.siteVisitDate) || "N/A"}
-                                  </p>
-                                </div>
-                                <div>
-                                  <p className="text-gray-500 font-medium">
-                                    Verification Status
-                                  </p>
-                                  <span className="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
-                                    Verified
-                                  </span>
-                                </div>
-                              </div>
-
-                              <div className="grid grid-cols-2 gap-3 text-sm">
-                                <div>
-                                  <p className="text-gray-500 font-medium">
-                                    Service Report
-                                  </p>
-                                  {ticket.serviceReportFile ? (
-                                    <a
-                                      href={ticket.serviceReportFile}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="text-blue-600 hover:text-blue-800 text-sm font-semibold"
-                                    >
-                                      View
-                                    </a>
-                                  ) : (
-                                    <p className="text-blue-900">N/A</p>
-                                  )}
-                                </div>
-                                <div>
-                                  <p className="text-gray-500 font-medium">
-                                    Video
-                                  </p>
-                                  {ticket.video ? (
-                                    <a
-                                      href={ticket.video}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="text-blue-600 hover:text-blue-800 text-sm font-semibold"
-                                    >
-                                      View
-                                    </a>
-                                  ) : (
-                                    <p className="text-blue-900">N/A</p>
-                                  )}
-                                </div>
-                              </div>
-
-                              <div className="grid grid-cols-2 gap-3 text-sm">
-                                <div>
-                                  <p className="text-gray-500 font-medium">
-                                    Quatation Receive
-                                  </p>
-                                  {ticket.quatationReceive ? (
-                                    <a
-                                      href={ticket.quatationReceive}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="text-blue-600 hover:text-blue-800 text-sm font-semibold"
-                                    >
-                                      View
-                                    </a>
-                                  ) : (
-                                    <p className="text-blue-900">N/A</p>
-                                  )}
-                                </div>
-                                <div>
-                                  <p className="text-gray-500 font-medium">
-                                    Locally Purchased Spares
-                                  </p>
-                                  <p className="text-blue-900">
-                                    {ticket.locallyPurchasedSpares || "N/A"}
-                                  </p>
-                                </div>
-                              </div>
-
-                              <div className="grid grid-cols-2 gap-3 text-sm">
-                                <div>
-                                  <p className="text-gray-500 font-medium">
-                                    Delay
-                                  </p>
-                                  <span
-                                    className={`px-2 py-1 text-xs font-semibold rounded-full ${
-                                      ticket.delayMinutes > 0
-                                        ? "bg-red-100 text-red-800"
-                                        : "bg-emerald-100 text-emerald-800"
-                                    }`}
-                                  >
-                                    {formatDelay(ticket.delayMinutes)}
-                                  </span>
-                                </div>
-                              </div>
-
-                              <div>
-                                <p className="text-gray-500 font-medium text-sm">
-                                  Remarks
-                                </p>
-                                <p className="text-blue-900 line-clamp-3">
-                                  {ticket.remarks || "N/A"}
-                                </p>
-                              </div>
-                            </CardContent>
-                          </Card>
-                        ))
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </TabsContent>
+                  ))}
+              </dl>
             </div>
-          </CardContent>
-        </Card>
-      </Tabs>
+          )}
+        />
+      </div>
 
       {/* Site Visit Verification Modal */}
       <Modal

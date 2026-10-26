@@ -1,73 +1,52 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import {
-  Search,
-  ChevronLeft,
-  ChevronRight,
-  Trash2,
-  SlidersHorizontal,
-  ChevronDown,
-} from 'lucide-react';
-import TableWrapper from '../../components/TableWrapper';
+import { Trash2, RefreshCw } from 'lucide-react';
 import ModalWrapper from '../../components/ModalWrapper';
+import { StatusTabs, FilterSearch, FilterChips, ColumnSelector, DataTable, StatusBadge, filterControlClass } from '../../components/shared';
 import formatDate from '../../utils/formatDate';
 import toast from 'react-hot-toast';
 import { supabase } from '../../lib/supabase/client';
 import { fetchDropdownRows } from '../../lib/supabase/dropdown';
+import { useAuthStore } from '../../store/authStore';
+import { useStageList, PAGE_SIZES } from '../../hooks/use-stage-list';
+import { scopeBy } from '../../lib/pagedView';
 
-const INITIAL_COLUMNS = [
-  'Ticket-ID',
-  'Company Name',
-  'Client Name',
-  'Phone Number',
-  'Machine Name',
-  'Mention Issue',
-  'Video Call Remarks',
-  'Engineer Assign',
-  'Enquiry Item List',
-  'Call Time',
-  'Date',
+// Pending / History come from flat SQL views (Database/03_video_call_views.sql):
+// search, filters, engineer scope and counts run in SQL, one page per request.
+//   Pending = no attempt yet, or the latest attempt is 'rescheduled'; History = any other latest attempt.
+const VIEWS = { pending: 'engg_v_video_call_pending', history: 'engg_v_video_call_history' };
+const FILTERS = [
+  { key: 'category', column: 'category', label: 'Category', allLabel: 'All Categories' },
+  { key: 'serviceLocation', column: 'service_location', label: 'Location', allLabel: 'All Locations' },
 ];
-
-// Column visibility rules (on top of the user's own Columns toggle):
-//  - Remarks (the video-call attempt's own remarks) exists only on History.
-//  - Engineer Assign is admin-role only (both tabs); Enquiry Item List is for everyone.
-const HISTORY_ONLY_COLUMNS = ['Video Call Remarks'];
-const ADMIN_ONLY_COLUMNS = ['Engineer Assign'];
-
-const ALL_COLUMNS = [
-  'Ticket-ID',
-  'Company Name',
-  'Client Name',
-  'Phone Number',
-  'Machine Name',
-  'Mention Issue',
-  'Video Call Remarks',
-  'Engineer Assign',
-  'Enquiry Item List',
-  'Call Time',
-  'Date',
-  'Source of enquiry',
-  'Call type',
-  'Enquiry Receiver Name',
-  'Client Type',
-  'GST Address',
-  'Site Address',
-  'GST No.',
-  'Category',
-  'Service Location',
-];
-
-const formatDateTime = (date) => {
-  const d = new Date(date);
-  const day = String(d.getDate()).padStart(2, "0");
-  const month = String(d.getMonth() + 1).padStart(2, "0");
-  const year = d.getFullYear();
-  const hours = String(d.getHours()).padStart(2, "0");
-  const minutes = String(d.getMinutes()).padStart(2, "0");
-  const seconds = String(d.getSeconds()).padStart(2, "0");
-
-  return `${day}/${month}/${year} ${hours}:${minutes}:${seconds}`;
+const ORDER = {
+  pending: [{ column: 'created_at', ascending: true }],
+  history: [{ column: 'created_at', ascending: false }],
 };
+
+// Columns the user may toggle. `defaultVisible` = the original default set.
+// Remarks (the attempt's own) exist only on History; Engineer Assign is admin-only.
+const ALL_COLUMNS = [
+  { key: 'ticketId', label: 'Ticket-ID', defaultVisible: true },
+  { key: 'companyName', label: 'Company Name', defaultVisible: true },
+  { key: 'clientName', label: 'Client Name', defaultVisible: true },
+  { key: 'phoneNumber', label: 'Phone Number', defaultVisible: true },
+  { key: 'machineName', label: 'Machine Name', defaultVisible: true },
+  { key: 'mentionIssue', label: 'Mention Issue', defaultVisible: true },
+  { key: 'remarks', label: 'Video Call Remarks', defaultVisible: true, tabs: ['history'] },
+  { key: 'engineerAssign', label: 'Engineer Assign', defaultVisible: true, adminOnly: true },
+  { key: 'enquiryItemList', label: 'Enquiry Item List', defaultVisible: true },
+  { key: 'videoCallTime', label: 'Call Time', defaultVisible: true },
+  { key: 'timeStemp', label: 'Date', defaultVisible: true },
+  { key: 'sourceOfEnquiry', label: 'Source of enquiry', defaultVisible: false },
+  { key: 'callType', label: 'Call type', defaultVisible: false },
+  { key: 'enquiryReceiverName', label: 'Enquiry Receiver Name', defaultVisible: false },
+  { key: 'clientType', label: 'Client Type', defaultVisible: false },
+  { key: 'gstAddress', label: 'GST Address', defaultVisible: false },
+  { key: 'siteAddress', label: 'Site Address', defaultVisible: false },
+  { key: 'gstNo', label: 'GST No.', defaultVisible: false },
+  { key: 'category', label: 'Category', defaultVisible: false },
+  { key: 'serviceLocation', label: 'Service Location', defaultVisible: false },
+];
 
 const formatCallTime = (timeStr) => {
   if (!timeStr) return "";
@@ -111,662 +90,254 @@ const formatCallTime = (timeStr) => {
   return str;
 };
 
-function getStoredRole() {
-  try {
-    const raw = localStorage.getItem("o2d-auth-storage");
-    return raw ? JSON.parse(raw)?.state?.user?.role || "" : "";
-  } catch {
-    return "";
+// View row -> the shape the row renderers and SolutionModal already use.
+// `id` = the ticket uuid (used for updates / uploads).
+const mapRow = (r) => {
+  const isPending = r.is_pending === true;
+  const s = (v) => String(v ?? '').trim();
+  return {
+    id: r.id,
+    timeStemp: s(r.ticket_created_at),
+    ticketId: s(r.ticket_id),
+    clientName: s(r.client_name),
+    phoneNumber: s(r.phone_number),
+    category: s(r.category),
+    callType: s(r.call_type),
+    requirementServiceCategory: s(r.category),
+    videoCall: s(r.video_call),
+    sourceOfEnquiry: s(r.source_of_enquiry),
+    enquiryReceiverName: s(r.enquiry_receiver_name),
+    clientType: s(r.client_type),
+    gstNo: s(r.gst_no),
+    mentionIssue: s(r.mention_issue),
+    enquiryItemList: s(r.enquiry_item_list),
+    machineName: s(r.machine_name),
+    enquiryType: s(r.enquiry_type),
+    siteName: s(r.site_address),
+    companyName: s(r.company_name),
+    gstAddress: s(r.gst_address),
+    siteAddress: s(r.site_address),
+    // "primary" and "final assign" collapse to the one sss_tickets.engineer_assign column.
+    engineerAssign: s(r.engineer_assign),
+    engineerAssignFA: s(r.engineer_assign),
+    serviceLocation: s(r.service_location),
+    otp: s(r.otp),
+    afterVideoCallGenerateOTP: s(r.otp),
+    planned2: 'planned',
+    actual2: isPending ? '' : s(r.attempt_created_at),
+    videoCallServicesSolve: s(r.enquiry_solved),
+    serviceType: s(r.service_type),
+    otpVarificationStatus: s(r.regeneration_status),
+    audioUrl: s(r.audio_link),
+    CREName: s(r.cre_name),
+    remarks: s(r.remarks),
+    itemQty: r.item_qty ? JSON.stringify(r.item_qty) : '',
+    videoCallTime: formatCallTime(s(r.video_call_time)),
+  };
+};
+
+const DROPDOWN_CATEGORY_TO_KEY = {
+  service_location: 'Service Location',
+  engineer_assign_name: 'Engineer Assign Name',
+  item_name: 'Item-Name',
+};
+
+// Paginated fetch — a plain unpaginated .select() silently truncates at Supabase's default
+// 1000-row cap, which item_name alone blows past on its own (~1400 rows), dropping other
+// categories' values.
+async function loadMasterData() {
+  const data = await fetchDropdownRows(Object.keys(DROPDOWN_CATEGORY_TO_KEY));
+  const structuredData = {};
+  (data || []).forEach(({ category, value }) => {
+    const key = DROPDOWN_CATEGORY_TO_KEY[category];
+    if (!key) return;
+    if (!structuredData[key]) structuredData[key] = [];
+    structuredData[key].push(value);
+  });
+  Object.keys(structuredData).forEach((key) => {
+    structuredData[key] = [...new Set(structuredData[key])];
+  });
+  return structuredData;
+}
+
+const Cell = ({ children, title, className = '' }) => (
+  <td className={`px-3.5 py-2 text-xs text-foreground align-middle ${className}`}>
+    <div className="max-w-[240px] truncate" title={title ?? (typeof children === 'string' ? children : undefined)}>
+      {children}
+    </div>
+  </td>
+);
+
+function renderCell(key, t) {
+  switch (key) {
+    case 'timeStemp':
+      return <Cell key={key}>{formatDate(t.timeStemp)}</Cell>;
+    case 'ticketId':
+      return <td key={key} className="px-3.5 py-2 whitespace-nowrap align-middle"><span className="rounded bg-secondary px-1.5 py-0.5 font-mono text-xs font-semibold text-foreground">{t.ticketId}</span></td>;
+    case 'clientName':
+      return <Cell key={key} className="font-semibold">{t.clientName || '-'}</Cell>;
+    case 'enquiryItemList':
+      return (
+        <td key={key} className="px-3.5 py-2 text-xs align-middle">
+          {t.enquiryItemList ? (
+            <a href={t.enquiryItemList} target="_blank" rel="noreferrer" className="font-semibold text-primary underline hover:text-brand-800">View</a>
+          ) : (
+            '-'
+          )}
+        </td>
+      );
+    case 'videoCallTime':
+      return <Cell key={key}>{t.videoCallTime || 'N/A'}</Cell>;
+    default:
+      return <Cell key={key}>{t[key] || '-'}</Cell>;
   }
 }
 
 export default function VideoCall() {
-  const [sales, setSales] = useState([]); // using 'sales' to keep naming consistent with pagination state
-  const [searchTerm, setSearchTerm] = useState('');
-  const [activeTab, setActiveTab] = useState('pending');
   const [selectedSale, setSelectedSale] = useState(null); // the selected ticket for the modal
-  const [fetchLoading, setFetchLoading] = useState(false);
   const [masterData, setMasterData] = useState({});
-  const [selectedColumns, setSelectedColumns] = useState(INITIAL_COLUMNS);
-  const [isDropdownOpen, setIsDropdownOpen] = useState(false);
+  const { user } = useAuthStore();
 
-  const handleColumnToggle = (colName) => {
-    setSelectedColumns((prev) => {
-      if (prev.includes(colName)) {
-        return prev.filter((col) => col !== colName);
-      } else {
-        return [...prev, colName];
-      }
-    });
-  };
-
-  useEffect(() => {
-    const handleClickOutside = (event) => {
-      if (isDropdownOpen && !event.target.closest('.columns-dropdown-container')) {
-        setIsDropdownOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
-    };
-  }, [isDropdownOpen]);
-
-  const isAdmin = getStoredRole() === 'admin';
-
-  // Columns this user/tab may see at all (also what the Columns dropdown lists).
-  const availableColumns = useMemo(
-    () =>
-      ALL_COLUMNS.filter((col) => {
-        if (ADMIN_ONLY_COLUMNS.includes(col) && !isAdmin) return false;
-        if (HISTORY_ONLY_COLUMNS.includes(col) && activeTab !== 'history') return false;
-        return true;
-      }),
-    [isAdmin, activeTab]
+  // Engineers only see tickets assigned to them; admins see everything.
+  const isEngineer = user?.role === 'ENGINEER';
+  const isAdmin = user?.role === 'ADMIN';
+  const scope = useMemo(
+    () => (isEngineer ? scopeBy(['engineer_assign'], [user?.name, user?.id]) : null),
+    [isEngineer, user?.name, user?.id]
   );
+  const columns = useMemo(() => ALL_COLUMNS.filter((c) => !c.adminOnly || isAdmin), [isAdmin]);
+  const list = useStageList({
+    key: 'video-call',
+    views: VIEWS,
+    scope,
+    scopeKey: isEngineer ? `eng:${user?.id}` : 'all',
+    filters: FILTERS,
+    columns,
+    order: ORDER,
+  });
 
-  const activeColumns = useMemo(() => {
-    return availableColumns.filter(col => selectedColumns.includes(col));
-  }, [availableColumns, selectedColumns]);
-  const [selectedCategory, setSelectedCategory] = useState('all');
-  const [selectedLocation, setSelectedLocation] = useState('all');
-
-
-
-  // Tickets ready for Video-Call: sss_warranty_check.video_call_planned set.
-  // Pending = no attempt yet, or the latest attempt is 'rescheduled' (a
-  // ticket only leaves Video-Call once an attempt lands on 'yes'/'no') —
-  // same logic as the main app's src/pages/VideoCallSolution.jsx.
-  const loadSales = async () => {
-    setFetchLoading(true);
-    try {
-      const { data: warrantyRows, error: warrantyError } = await supabase
-        .from('sss_warranty_check')
-        .select('ticket_id, video_call_planned')
-        .not('video_call_planned', 'is', null);
-
-      if (warrantyError) throw warrantyError;
-
-      const ticketIds = [...new Set((warrantyRows || []).map((w) => w.ticket_id))];
-
-      if (ticketIds.length === 0) {
-        setSales([]);
-        return;
-      }
-
-      const [ticketsRes, attemptsRes] = await Promise.all([
-        supabase.from('sss_tickets').select('*').in('ticket_id', ticketIds),
-        supabase.from('sss_video_call').select('*').in('ticket_id', ticketIds).order('created_at', { ascending: false }),
-      ]);
-
-      if (ticketsRes.error) throw ticketsRes.error;
-      if (attemptsRes.error) throw attemptsRes.error;
-
-      const latestAttemptByTicket = new Map();
-      (attemptsRes.data || []).forEach((a) => {
-        if (!latestAttemptByTicket.has(a.ticket_id)) latestAttemptByTicket.set(a.ticket_id, a);
-      });
-
-      const allData = (ticketsRes.data || []).map((t) => {
-        const latest = latestAttemptByTicket.get(t.ticket_id);
-        const isPending = !latest || latest.enquiry_solved === 'rescheduled';
-
-        return {
-          id: t.uuid, // ticket_uuid — used for updates/uploads, not a sheet row index anymore
-          timeStemp: String(t.created_at || "").trim(),
-          ticketId: String(t.ticket_id || "").trim(),
-          clientName: String(t.client_name || "").trim(),
-          phoneNumber: String(t.phone_number || "").trim(),
-          category: String(t.category || "").trim(),
-          callType: String(t.call_type || "").trim(),
-          requirementServiceCategory: String(t.category || "").trim(),
-          videoCall: String(t.video_call || "").trim(),
-          sourceOfEnquiry: String(t.source_of_enquiry || "").trim(),
-          enquiryReceiverName: String(t.enquiry_receiver_name || "").trim(),
-          clientType: String(t.client_type || "").trim(),
-          gstNo: String(t.gst_no || "").trim(),
-          mentionIssue: String(t.mention_issue || "").trim(),
-          enquiryItemList: String(t.enquiry_item_list || "").trim(),
-          machineName: String(t.machine_name || "").trim(),
-          enquiryType: String(t.enquiry_type || "").trim(),
-          siteName: String(t.site_address || "").trim(),
-          companyName: String(t.company_name || "").trim(),
-          gstAddress: String(t.gst_address || "").trim(),
-          siteAddress: String(t.site_address || "").trim(),
-          // Both "primary" and "final assign" collapse to the one
-          // sss_tickets.engineer_assign column in the new schema.
-          engineerAssign: String(t.engineer_assign || "").trim(),
-          engineerAssignFA: String(t.engineer_assign || "").trim(),
-          serviceLocation: String(t.service_location || "").trim(),
-          otp: String(t.otp || "").trim(),
-          afterVideoCallGenerateOTP: String(t.otp || "").trim(),
-          planned2: String(t.warranty_check_planned || "planned").trim(), // presence only — gating already done above
-          actual2: isPending ? "" : String(latest.created_at || "").trim(),
-          videoCallServicesSolve: latest ? String(latest.enquiry_solved || "").trim() : "",
-          serviceType: latest ? String(latest.service_type || "").trim() : "",
-          otpVarificationStatus: latest ? String(latest.regeneration_status || "").trim() : "",
-          audioUrl: latest ? String(latest.audio_link || "").trim() : "",
-          CREName: String(t.cre_name || "").trim(),
-          remarks: latest ? String(latest.remarks || "").trim() : "",
-          itemQty: latest && latest.item_qty ? JSON.stringify(latest.item_qty) : "",
-          videoCallTime: formatCallTime(String(t.video_call_time || "").trim()),
-        };
-      });
-
-      setSales(allData);
-    } catch (error) {
-      console.error("Error fetching video call data:", error);
-      toast.error("Failed to load live data");
-    } finally {
-      setFetchLoading(false);
-    }
-  };
-
-  const DROPDOWN_CATEGORY_TO_KEY = {
-    service_location: 'Service Location',
-    engineer_assign_name: 'Engineer Assign Name',
-    item_name: 'Item-Name',
-  };
-
-  const fetchMasterSheet = async () => {
-    try {
-      // Paginated fetch — a plain unpaginated .select() silently truncates
-      // at Supabase's default 1000-row cap, which item_name alone blows
-      // past on its own (~1400 rows), dropping other categories' values.
-      const data = await fetchDropdownRows(Object.keys(DROPDOWN_CATEGORY_TO_KEY));
-
-      const structuredData = {};
-      (data || []).forEach(({ category, value }) => {
-        const key = DROPDOWN_CATEGORY_TO_KEY[category];
-        if (!key) return;
-        if (!structuredData[key]) structuredData[key] = [];
-        structuredData[key].push(value);
-      });
-
-      Object.keys(structuredData).forEach((key) => {
-        structuredData[key] = [...new Set(structuredData[key])];
-      });
-
-      setMasterData(structuredData);
-    } catch (error) {
-      console.error("Error fetching master data:", error);
-    }
-  };
-
+  const { reload } = list;
   useEffect(() => {
-    loadSales();
-    fetchMasterSheet();
-    const handleRefresh = () => loadSales();
+    loadMasterData().then(setMasterData).catch((error) => console.error("Error fetching master data:", error));
+    const handleRefresh = () => reload();
     window.addEventListener('refresh_sales', handleRefresh);
     return () => window.removeEventListener('refresh_sales', handleRefresh);
-  }, []);
+  }, [reload]);
 
-  const userName = localStorage.getItem("currentUsername");
-  const roleStorage = localStorage.getItem("o2d-auth-storage");
-  let role = "admin";
-  if (roleStorage) {
-    try {
-      const parsedData = JSON.parse(roleStorage);
-      role = parsedData.state.user.role;
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
-  const uniqueCategories = useMemo(() => {
-    return Array.from(new Set(sales.map(s => s.category).filter(Boolean))).sort();
-  }, [sales]);
-
-  const uniqueLocations = useMemo(() => {
-    return Array.from(new Set(sales.map(s => s.serviceLocation).filter(Boolean))).sort();
-  }, [sales]);
-
-  const filteredSales = sales
-    .filter((ticket) => {
-      // Tab filtering
-      if (activeTab === 'pending') {
-        if (ticket.actual2 !== "") return false;
-      } else if (activeTab === 'history') {
-        if (ticket.actual2 === "") return false;
-      }
-
-      // Role-based filtering
-      if (role === "user" && ticket.CREName !== userName) return false;
-      if (role === "engineer" && ticket.engineerAssignFA !== userName) return false;
-
-      // Category filter
-      if (selectedCategory !== 'all' && ticket.category !== selectedCategory) return false;
-
-      // Location filter
-      if (selectedLocation !== 'all' && ticket.serviceLocation !== selectedLocation) return false;
-
-      // Search filter
-      const q = searchTerm.toLowerCase();
-      const matchesSearch =
-        String(ticket.ticketId || "").toLowerCase().includes(q) ||
-        String(ticket.enquiryReceiverName || "").toLowerCase().includes(q) ||
-        String(ticket.companyName || "").toLowerCase().includes(q) ||
-        String(ticket.clientName || "").toLowerCase().includes(q) ||
-        String(ticket.phoneNumber || "").includes(q);
-      return matchesSearch;
-    });
+  const isPending = list.tab === 'pending';
+  const rows = useMemo(() => list.rows.map(mapRow), [list.rows]);
+  const headers = [{ label: 'Action', className: 'w-24' }, ...list.activeColumns.map((c) => c.label)];
 
   return (
-    <div className="space-y-5 flex-1 flex flex-col min-h-0 overflow-hidden pr-1">
-      {/* Filter Row */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 bg-white border border-slate-200 p-4 rounded-xl shadow-sm">
-        {/* Tab Selection */}
-        <div className="flex border border-slate-250 bg-slate-50/50 p-1 rounded-xl gap-1">
-          <button
-            onClick={() => { setActiveTab('pending'); }}
-            className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all ${activeTab === 'pending'
-              ? 'bg-indigo-600 text-white shadow-sm'
-              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'
-              }`}
-          >
-            Pending ({sales.filter(t => t.actual2 === "" && (role !== "user" || t.CREName === userName) && (role !== "engineer" || t.engineerAssignFA === userName)).length})
-          </button>
-          <button
-            onClick={() => { setActiveTab('history'); }}
-            className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all ${activeTab === 'history'
-              ? 'bg-indigo-600 text-white shadow-sm'
-              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'
-              }`}
-          >
-            History ({sales.filter(t => t.actual2 !== "" && (role !== "user" || t.CREName === userName) && (role !== "engineer" || t.engineerAssignFA === userName)).length})
-          </button>
-        </div>
-
-        {/* Filters and Search Bar */}
-        <div className="grid grid-cols-2 md:flex md:items-center gap-3 w-full md:w-auto">
-          {/* Category Filter */}
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      {/* One toolbar row */}
+      <div className="flex flex-wrap items-center gap-2">
+        <StatusTabs tabs={list.tabs} activeTab={list.tab} onChange={list.setTab} label="Video call views" />
+        <FilterSearch
+          value={list.search}
+          onChange={list.setSearch}
+          placeholder="Search ticket, client, company, phone..."
+          className="min-w-[220px] flex-1"
+        />
+        {FILTERS.map((f) => (
           <select
-            value={selectedCategory}
-            onChange={(e) => setSelectedCategory(e.target.value)}
-            className="block text-xs bg-slate-50 border border-slate-200 rounded-lg p-1.5 text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-400 cursor-pointer h-9 w-full md:w-auto"
+            key={f.key}
+            aria-label={f.label}
+            value={list.filterValues[f.key]}
+            onChange={(e) => list.setFilter(f.key, e.target.value)}
+            className={`${filterControlClass} !w-auto min-w-[140px] max-w-[200px]`}
           >
-            <option value="all">All Categories</option>
-            {uniqueCategories.map(cat => (
-              <option key={cat} value={cat}>{cat}</option>
+            <option value="all">{f.allLabel}</option>
+            {list.filterOptions[f.key].map((v) => (
+              <option key={v} value={v}>{v}</option>
             ))}
           </select>
-
-          {/* Service Location Filter */}
-          <select
-            value={selectedLocation}
-            onChange={(e) => setSelectedLocation(e.target.value)}
-            className="block text-xs bg-slate-50 border border-slate-200 rounded-lg p-1.5 text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-400 cursor-pointer h-9 w-full md:w-auto"
-          >
-            <option value="all">All Locations</option>
-            {uniqueLocations.map(loc => (
-              <option key={loc} value={loc}>{loc}</option>
-            ))}
-          </select>
-
-          {/* Search Bar */}
-          <div className="relative w-full md:w-60">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-400" />
-            <input
-              type="text"
-              placeholder="Search"
-              value={searchTerm}
-              onChange={(e) => { setSearchTerm(e.target.value); }}
-              className="block w-full pl-8.5 pr-3 py-1.5 text-xs bg-slate-50/50 border border-slate-200 rounded-lg text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:bg-white transition-all pl-10"
-            />
-          </div>
-
-          {/* Columns Dropdown */}
-          <div className="relative columns-dropdown-container w-full md:w-auto">
-            <button
-              type="button"
-              onClick={() => setIsDropdownOpen(!isDropdownOpen)}
-              className="flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs bg-slate-50/50 hover:bg-slate-100/75 border border-slate-200 rounded-lg text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-400 transition-all font-bold h-9 cursor-pointer shadow-sm select-none w-full md:w-auto"
-            >
-              <SlidersHorizontal className="h-3.5 w-3.5 text-slate-500" />
-              <span>Columns</span>
-              <ChevronDown className={`h-3.5 w-3.5 text-slate-400 transition-transform duration-200 ${isDropdownOpen ? 'rotate-180' : ''}`} />
-            </button>
-
-            {isDropdownOpen && (
-              <div className="absolute right-0 mt-2 w-56 bg-white border border-slate-200 rounded-xl shadow-xl z-50 p-2 max-h-72 overflow-y-auto animate-in fade-in slide-in-from-top-1 duration-150">
-                <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider px-2 py-1 border-b border-slate-100 mb-1">
-                  Visible Columns
-                </div>
-                {availableColumns.map((col) => {
-                  const isChecked = selectedColumns.includes(col);
-                  return (
-                    <label
-                      key={col}
-                      className="flex items-center gap-2.5 px-2.5 py-1.5 text-xs font-semibold rounded-lg cursor-pointer transition-all text-slate-600 hover:text-slate-950 hover:bg-indigo-50/40 select-none"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={isChecked}
-                        onChange={() => handleColumnToggle(col)}
-                        className="h-3.5 w-3.5 text-indigo-600 focus:ring-indigo-500 border-slate-300 rounded cursor-pointer transition-colors"
-                      />
-                      <span>{col}</span>
-                    </label>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        </div>
+        ))}
+        <button
+          type="button"
+          onClick={list.reload}
+          disabled={list.fetching}
+          aria-label="Refresh"
+          className="inline-flex h-9 items-center justify-center rounded-md border border-input bg-card w-9 text-sm text-foreground transition-colors hover:bg-accent disabled:opacity-50"
+        >
+          <RefreshCw className={`h-4 w-4 ${list.fetching ? 'animate-spin' : ''}`} aria-hidden="true" />
+        </button>
+        <ColumnSelector {...list.columnPanel} />
       </div>
+      <FilterChips chips={list.chips} onClearAll={list.clearAll} />
 
-      {/* Table */}
-      <div className="flex-1 min-h-0 flex flex-col justify-between gap-4">
-        <TableWrapper
-          headers={['Action', ...activeColumns]}
-          data={filteredSales}
-          emptyMessage={fetchLoading ? <>
-            {/* spinner */}
-            <div className="flex items-center justify-center flex-col ">
-              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500"></div>
-              <p>Loading...</p>
-            </div>
-          </> : "No entries found in this folder."}
-          renderCard={(ticket) => {
-            const isPending = activeTab === 'pending';
-            const statusBorder = isPending ? "border-l-blue-500" : "border-l-emerald-500";
-            return (
-              <div key={ticket.id} className={`bg-white rounded-xl border border-slate-200 shadow-sm p-4 space-y-3 relative border-l-4 ${statusBorder}`}>
-                {/* Top Right Action Button or Status */}
-                <div className="absolute top-4 right-4">
-                  {isPending ? (
-                    <button
-                      onClick={() => setSelectedSale(ticket)}
-                      className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm"
-                    >
-                      Solution
-                    </button>
-                  ) : (
-                    <span className="text-[10px] uppercase font-bold text-emerald-600 bg-emerald-50 border border-emerald-250 py-1 px-2.5 rounded-lg">
-                      Solved
-                    </span>
-                  )}
-                </div>
-
-                {/* Header / Info */}
-                <div className="pr-24">
-                  {activeColumns.includes('Ticket-ID') && (
-                    <span className="text-[10px] font-mono font-bold bg-slate-100 px-1.5 py-0.5 rounded text-slate-700">
-                      {ticket.ticketId}
-                    </span>
-                  )}
-                  {activeColumns.includes('Date') && (
-                    <p className="text-[11px] text-slate-500 mt-1">
-                      {formatDate(ticket.timeStemp)}
-                    </p>
-                  )}
-                </div>
-
-                <div className="pt-2 border-t border-slate-100 space-y-2 text-xs">
-                  <div className="grid grid-cols-2 gap-3">
-                    {activeColumns.includes('Client Name') && (
-                      <div>
-                        <p className="text-slate-500 font-medium">Client Name</p>
-                        <p className="text-slate-800 font-semibold">{ticket.clientName || "N/A"}</p>
-                      </div>
-                    )}
-                    {activeColumns.includes('Company Name') && (
-                      <div>
-                        <p className="text-slate-500 font-medium">Company Name</p>
-                        <p className="text-slate-800 font-semibold">{ticket.companyName || "N/A"}</p>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3 pt-1">
-                    {activeColumns.includes('Phone Number') && (
-                      <div>
-                        <p className="text-slate-500 font-medium">Phone Number</p>
-                        <p className="text-slate-800">{ticket.phoneNumber || "N/A"}</p>
-                      </div>
-                    )}
-                    {activeColumns.includes('Machine Name') && (
-                      <div>
-                        <p className="text-slate-500 font-medium">Machine Name</p>
-                        <p className="text-slate-800">{ticket.machineName || "N/A"}</p>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3 pt-1">
-                    {activeColumns.includes('Call Time') && (
-                      <div>
-                        <p className="text-slate-500 font-medium">Call Time</p>
-                        <p className="text-slate-800">{ticket.videoCallTime || "N/A"}</p>
-                      </div>
-                    )}
-                    {activeColumns.includes('Service Location') && (
-                      <div>
-                        <p className="text-slate-500 font-medium">Service Location</p>
-                        <p className="text-slate-800">{ticket.serviceLocation || "N/A"}</p>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3 pt-1">
-                    {activeColumns.includes('Category') && (
-                      <div>
-                        <p className="text-slate-500 font-medium">Category</p>
-                        <p className="text-slate-800">{ticket.category || "N/A"}</p>
-                      </div>
-                    )}
-                    {activeColumns.includes('Client Type') && (
-                      <div>
-                        <p className="text-slate-500 font-medium">Client Type</p>
-                        <p className="text-slate-800">{ticket.clientType || "N/A"}</p>
-                      </div>
-                    )}
-                  </div>
-
-                  {activeColumns.includes('Mention Issue') && ticket.mentionIssue && (
-                    <div className="pt-1">
-                      <p className="text-slate-500 font-medium">Mention Issue</p>
-                      <p className="text-slate-700">{ticket.mentionIssue}</p>
-                    </div>
-                  )}
-
-                  {activeColumns.includes('Video Call Remarks') && ticket.remarks && (
-                    <div className="pt-1">
-                      <p className="text-slate-500 font-medium">Video Call Remarks</p>
-                      <p className="text-slate-700">{ticket.remarks}</p>
-                    </div>
-                  )}
-
-                  {activeColumns.includes('Engineer Assign') && ticket.engineerAssign && (
-                    <div className="pt-1">
-                      <p className="text-slate-500 font-medium">Engineer Assign</p>
-                      <p className="text-slate-700">{ticket.engineerAssign}</p>
-                    </div>
-                  )}
-
-                  {activeColumns.includes('Enquiry Item List') && ticket.enquiryItemList && (
-                    <div className="pt-1">
-                      <p className="text-slate-500 font-medium">Enquiry Item List</p>
-                      <a href={ticket.enquiryItemList} target="_blank" rel="noreferrer" className="text-indigo-600 underline font-semibold">View</a>
-                    </div>
-                  )}
-
-                  {activeColumns.includes('GST Address') && ticket.gstAddress && (
-                    <div className="pt-1 bg-slate-50 p-2 rounded-lg">
-                      <p className="text-slate-500 font-medium text-[10px]">GST Address</p>
-                      <p className="text-[11px] text-slate-700">{ticket.gstAddress}</p>
-                    </div>
-                  )}
-
-                  {activeColumns.includes('Site Address') && ticket.siteAddress && (
-                    <div className="pt-1 bg-slate-50 p-2 rounded-lg">
-                      <p className="text-slate-500 font-medium text-[10px]">Site Address</p>
-                      <p className="text-[11px] text-slate-700">{ticket.siteAddress}</p>
-                    </div>
-                  )}
-
-                  {activeColumns.includes('GST No.') && ticket.gstNo && (
-                    <div className="pt-1">
-                      <p className="text-slate-500 font-medium">GST No.</p>
-                      <p className="text-slate-800 font-mono">{ticket.gstNo}</p>
-                    </div>
-                  )}
-                </div>
-              </div>
-            );
-          }}
+      <div className="min-h-0 flex-1">
+        <DataTable
+          ariaLabel={isPending ? 'Pending video calls' : 'Video call history'}
+          headers={headers}
+          data={rows}
+          loading={list.loading}
+          error={list.error}
+          onRetry={list.reload}
+          emptyTitle={list.chips.length ? 'No tickets match these filters' : isPending ? 'No pending video calls' : 'No video call history yet'}
+          currentPage={list.page}
+          totalPages={list.totalPages}
+          itemsPerPage={list.pageSize}
+          totalResults={list.total}
+          onPageChange={list.setPage}
+          onItemsPerPageChange={list.setPageSize}
+          itemsPerPageOptions={PAGE_SIZES}
           renderRow={(ticket) => (
-            <tr key={ticket.id} className="hover:bg-indigo-50/30 transition-colors">
-              <td className="px-5 py-3.5">
-                {activeTab === 'pending' ? (
+            <tr key={ticket.id}>
+              <td className="px-3.5 py-2 align-middle">
+                {isPending ? (
                   <button
+                    type="button"
                     onClick={() => setSelectedSale(ticket)}
-                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm"
+                    className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
                   >
                     Solution
                   </button>
                 ) : (
-                  <span className="text-[10px] uppercase font-bold text-emerald-600 bg-emerald-50 border border-emerald-250 py-1 px-2.5 rounded-lg">
-                    Solved
-                  </span>
+                  <StatusBadge tone="success">Solved</StatusBadge>
                 )}
               </td>
-              {activeColumns.map((colName) => {
-                switch (colName) {
-                  case 'Date':
-                    return (
-                      <td key="Date" className="px-5 py-3.5 whitespace-nowrap text-xs text-slate-600">
-                        {formatDate(ticket.timeStemp)}
-                      </td>
-                    );
-                  case 'Ticket-ID':
-                    return (
-                      <td key="Ticket-ID" className="px-5 py-3.5 whitespace-nowrap">
-                        <span className="text-xs font-mono font-bold bg-slate-100 px-1.5 py-0.5 rounded text-slate-700">{ticket.ticketId}</span>
-                      </td>
-                    );
-                  case 'Source of enquiry':
-                    return (
-                      <td key="Source of enquiry" className="px-5 py-3.5 text-xs text-slate-600">
-                        {ticket.sourceOfEnquiry}
-                      </td>
-                    );
-                  case 'Call type':
-                    return (
-                      <td key="Call type" className="px-5 py-3.5 text-xs text-slate-600">
-                        {ticket.callType}
-                      </td>
-                    );
-                  case 'Enquiry Receiver Name':
-                    return (
-                      <td key="Enquiry Receiver Name" className="px-5 py-3.5 text-xs text-slate-600">
-                        {ticket.enquiryReceiverName}
-                      </td>
-                    );
-                  case 'Client Type':
-                    return (
-                      <td key="Client Type" className="px-5 py-3.5 text-xs text-slate-600">
-                        {ticket.clientType}
-                      </td>
-                    );
-                  case 'Company Name':
-                    return (
-                      <td key="Company Name" className="px-5 py-3.5 text-xs text-slate-600">
-                        {ticket.companyName}
-                      </td>
-                    );
-                  case 'Client Name':
-                    return (
-                      <td key="Client Name" className="px-5 py-3.5 text-xs font-bold text-slate-800">
-                        {ticket.clientName}
-                      </td>
-                    );
-                  case 'Phone Number':
-                    return (
-                      <td key="Phone Number" className="px-5 py-3.5 text-xs text-slate-600 whitespace-nowrap">
-                        {ticket.phoneNumber}
-                      </td>
-                    );
-                  case 'GST Address':
-                    return (
-                      <td key="GST Address" className="px-5 py-3.5 text-xs text-slate-600">
-                        {ticket.gstAddress}
-                      </td>
-                    );
-                  case 'Site Address':
-                    return (
-                      <td key="Site Address" className="px-5 py-3.5 text-xs text-slate-600 max-w-[220px] truncate" title={ticket.siteAddress}>
-                        {ticket.siteAddress}
-                      </td>
-                    );
-                  case 'GST No.':
-                    return (
-                      <td key="GST No." className="px-5 py-3.5 text-xs text-slate-600">
-                        {ticket.gstNo}
-                      </td>
-                    );
-                  case 'Machine Name':
-                    return (
-                      <td key="Machine Name" className="px-5 py-3.5 text-xs text-slate-600">
-                        {ticket.machineName}
-                      </td>
-                    );
-                  case 'Category':
-                    return (
-                      <td key="Category" className="px-5 py-3.5 text-xs text-slate-600">
-                        {ticket.category}
-                      </td>
-                    );
-                  case 'Mention Issue':
-                    return (
-                      <td key="Mention Issue" className="px-5 py-3.5 text-xs text-slate-600 max-w-[200px] truncate" title={ticket.mentionIssue}>
-                        {ticket.mentionIssue}
-                      </td>
-                    );
-                  case 'Video Call Remarks':
-                    return (
-                      <td key="Video Call Remarks" className="px-5 py-3.5 text-xs text-slate-600 max-w-[220px] truncate" title={ticket.remarks}>
-                        {ticket.remarks}
-                      </td>
-                    );
-                  case 'Engineer Assign':
-                    return (
-                      <td key="Engineer Assign" className="px-5 py-3.5 text-xs text-slate-600 whitespace-nowrap">
-                        {ticket.engineerAssign}
-                      </td>
-                    );
-                  case 'Enquiry Item List':
-                    return (
-                      <td key="Enquiry Item List" className="px-5 py-3.5 text-xs text-slate-600">
-                        {ticket.enquiryItemList ? (
-                          <a href={ticket.enquiryItemList} target="_blank" rel="noreferrer" className="text-indigo-600 underline hover:text-indigo-800 font-semibold">
-                            View
-                          </a>
-                        ) : (
-                          '-'
-                        )}
-                      </td>
-                    );
-                  case 'Call Time':
-                    return (
-                      <td key="Call Time" className="px-5 py-3.5 text-xs text-slate-600 whitespace-nowrap">
-                        {ticket.videoCallTime || "N/A"}
-                      </td>
-                    );
-                  case 'Service Location':
-                    return (
-                      <td key="Service Location" className="px-5 py-3.5 text-xs text-slate-600">
-                        {ticket.serviceLocation}
-                      </td>
-                    );
-                  default:
-                    return null;
-                }
-              })}
+              {list.activeColumns.map((c) => renderCell(c.key, ticket))}
             </tr>
           )}
+          renderCard={(ticket) => (
+            <div key={ticket.id} className="space-y-2 rounded-lg border bg-card p-3 text-xs shadow-sm">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <span className="rounded bg-secondary px-1.5 py-0.5 font-mono font-semibold">{ticket.ticketId}</span>
+                  <p className="mt-1 text-muted-foreground">{formatDate(ticket.timeStemp)}</p>
+                </div>
+                {isPending ? (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedSale(ticket)}
+                    className="inline-flex h-8 items-center rounded-md bg-primary px-3 font-semibold text-primary-foreground"
+                  >
+                    Solution
+                  </button>
+                ) : (
+                  <StatusBadge tone="success">Solved</StatusBadge>
+                )}
+              </div>
+              <dl className="grid grid-cols-2 gap-x-3 gap-y-2 border-t pt-2">
+                {list.activeColumns
+                  .filter((c) => !['ticketId', 'timeStemp'].includes(c.key) && ticket[c.key])
+                  .map((c) => (
+                    <div key={c.key} className={['mentionIssue', 'remarks', 'gstAddress', 'siteAddress', 'companyName'].includes(c.key) ? 'col-span-2' : ''}>
+                      <dt className="text-muted-foreground">{c.label}</dt>
+                      <dd className="break-words font-medium">
+                        {c.key === 'enquiryItemList' ? (
+                          <a href={ticket.enquiryItemList} target="_blank" rel="noreferrer" className="font-semibold text-primary underline">View</a>
+                        ) : (
+                          ticket[c.key]
+                        )}
+                      </dd>
+                    </div>
+                  ))}
+              </dl>
+            </div>
+          )}
         />
-
       </div>
 
       {/* Workflow Modal */}
@@ -775,7 +346,7 @@ export default function VideoCall() {
           isOpen={!!selectedSale}
           onClose={() => setSelectedSale(null)}
           sale={selectedSale}
-          onSave={loadSales}
+          onSave={list.reload}
           masterData={masterData}
         />
       )}
@@ -815,7 +386,6 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
   // submit time in handleSubmit (same as the main app's own VideoCallSolution.jsx).
   const [audioFile, setAudioFile] = useState(null);
   const [audioUrl, setAudioUrl] = useState('');
-  const [isUploadingAudio, setIsUploadingAudio] = useState(false);
 
   useEffect(() => {
     if (sale) {
@@ -846,7 +416,6 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
   };
 
   const uploadAudioToDrive = async (file) => {
-    setIsUploadingAudio(true);
     try {
       const path = `video_call/${sale.ticketId}_${Date.now()}_${file.name}`;
 
@@ -863,8 +432,6 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
       console.error("Error uploading audio:", error);
       toast.error(error.message || "Failed to upload audio");
       return { success: false, error: error.message };
-    } finally {
-      setIsUploadingAudio(false);
     }
   };
 

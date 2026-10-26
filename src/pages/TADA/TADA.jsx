@@ -1,25 +1,139 @@
-import { useState, useEffect } from "react";
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "../../components/ui/card";
+import { useState, useEffect, useMemo } from "react";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
-import {
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from "../../components/ui/tabs";
 import { Modal } from "../../components/ui/modal";
 import toast from "react-hot-toast";
-import { Eye, Loader2Icon, LoaderIcon } from "lucide-react";
+import { Car, Loader2Icon, RefreshCw } from "lucide-react";
 import { Textarea } from "../../components/ui/textarea";
 import { supabase } from "../../lib/supabase/client";
 import { sendTadaApprovalEmail } from "../../lib/notifications/email";
+import { StatusTabs, FilterSearch, FilterChips, ColumnSelector, DataTable, filterControlClass } from "../../components/shared";
+import formatDisplayDate from "../../utils/formatDate";
+import { useAuthStore } from "../../store/authStore";
+import { useStageList, PAGE_SIZES } from "../../hooks/use-stage-list";
+import { scopeBy } from "../../lib/pagedView";
+
+// Pending / History come from flat SQL views (Database/04_tada_views.sql):
+// search, filters, engineer scope and counts run in SQL, one page per request.
+//   Pending = no sss_tada row yet; History = a sss_tada row exists.
+const VIEWS = { pending: "engg_v_tada_pending", history: "engg_v_tada_history" };
+const FILTERS = [
+  { key: "serviceLocation", column: "service_location", label: "Location", allLabel: "All Locations" },
+  { key: "category", column: "category", label: "Category", allLabel: "All Categories" },
+];
+const ORDER = {
+  pending: [{ column: "created_at", ascending: false }],
+  history: [{ column: "created_at", ascending: false }],
+};
+const COLUMNS = [
+  { key: "timeStemp", label: "Date", defaultVisible: true },
+  { key: "ticketId", label: "Ticket ID", defaultVisible: true },
+  { key: "sourceOfEnquiry", label: "Source of enquiry", defaultVisible: false },
+  { key: "callType", label: "Call type", defaultVisible: false },
+  { key: "enquiryReceiverName", label: "Enquiry Receiver Name", defaultVisible: false },
+  { key: "clientType", label: "Client Type", defaultVisible: false },
+  { key: "companyName", label: "Company Name", defaultVisible: true },
+  { key: "clientName", label: "Client Name", defaultVisible: true },
+  { key: "phoneNumber", label: "Phone Number", defaultVisible: true },
+  { key: "gstAddress", label: "Billing Address", defaultVisible: false },
+  { key: "siteAddress", label: "Site Address", defaultVisible: false },
+  { key: "gstNo", label: "GST No.", defaultVisible: false },
+  { key: "machineName", label: "Machine Name", defaultVisible: true },
+  { key: "category", label: "Category", defaultVisible: false },
+  { key: "mentionIssue", label: "Mention Issue", defaultVisible: true },
+  { key: "serviceLocation", label: "Service Location", defaultVisible: true },
+  { key: "quotationNo", label: "Quotation No.", defaultVisible: true },
+  { key: "warrantyCheck", label: "Warranty Check", defaultVisible: true, tabs: ["pending"] },
+  { key: "engineerAssign", label: "Engineer Assign", defaultVisible: true },
+  { key: "dateOfVisit", label: "Date of Visit", defaultVisible: true, tabs: ["pending"] },
+  { key: "transportation", label: "Transportation", defaultVisible: true, tabs: ["pending"] },
+  { key: "travelDate", label: "Travel Date", defaultVisible: true, tabs: ["history"] },
+  { key: "returnDate", label: "Return Date", defaultVisible: true, tabs: ["history"] },
+  { key: "destinationInput", label: "Destination", defaultVisible: true, tabs: ["history"] },
+  { key: "purposeOfTravel", label: "Purpose", defaultVisible: true, tabs: ["history"] },
+  { key: "amount", label: "Amount", defaultVisible: true, tabs: ["history"] },
+  { key: "quotationPdfLink", label: "Quotation PDF", defaultVisible: true },
+];
+const DATE_KEYS = ["timeStemp", "dateOfVisit", "travelDate", "returnDate"];
+const WIDE_KEYS = ["mentionIssue", "gstAddress", "siteAddress", "purposeOfTravel", "destinationInput", "companyName"];
+
+const cleanQuotationNo = (q) => (q ? String(q).replace(/^(Quotation|Quo|QUO|Quo\.)[:\-\s.]*/i, "").trim() : "");
+
+// View row -> the shape the row renderers and the TADA form already use.
+// `id` = the ticket uuid (the TADA form submits against it).
+const mapRow = (r) => ({
+  id: r.id,
+  timeStemp: r.created_at || "",
+  ticketId: r.ticket_id || "",
+  sourceOfEnquiry: r.source_of_enquiry || "",
+  callType: r.call_type || "",
+  enquiryReceiverName: r.enquiry_receiver_name || "",
+  clientType: r.client_type || "",
+  companyName: r.company_name || "",
+  clientName: r.client_name || "",
+  phoneNumber: r.phone_number || "",
+  gstAddress: r.gst_address || "",
+  siteAddress: r.site_address || "",
+  gstNo: r.gst_no || "",
+  machineName: r.machine_name || "",
+  category: r.category || "",
+  mentionIssue: r.mention_issue || "",
+  serviceLocation: r.service_location || "",
+  engineerAssign: r.engineer_assign || "",
+  warrantyCheck: r.warranty_check || "",
+  siteName: r.site_address || "",
+  quotationNo: r.quotation_no || "",
+  quotationPdfLink: r.quotation_pdf_link || "",
+  dateOfVisit: r.date_of_visit || "",
+  transportation: r.transportation || "",
+  CREName: r.cre_name || "",
+  travelDate: r.travel_date || "",
+  returnDate: r.return_date || "",
+  destinationInput: r.destination || "",
+  purposeOfTravel: r.purpose_of_travel || "",
+  amount: r.amount || "",
+  expectedCompletionDate: r.expected_completion_date || "",
+  expectedCompletionTime: r.expected_completion_time || "",
+  otpVerificationPlanned: r.otp_verification_planned || "",
+  delayMinutes: r.delay_minutes,
+});
+
+function cellText(key, t) {
+  if (DATE_KEYS.includes(key)) return t[key] ? formatDisplayDate(t[key]) : "";
+  if (key === "quotationNo") return cleanQuotationNo(t.quotationNo);
+  if (key === "amount") return `₹${t.amount || "0"}`;
+  return t[key] || "";
+}
+
+function renderCell(key, t) {
+  if (key === "ticketId") {
+    return (
+      <td key={key} className="px-3.5 py-2 whitespace-nowrap align-middle">
+        <span className="rounded bg-secondary px-1.5 py-0.5 font-mono text-xs font-semibold text-foreground">{t.ticketId}</span>
+      </td>
+    );
+  }
+  if (key === "quotationPdfLink") {
+    return (
+      <td key={key} className="px-3.5 py-2 text-xs align-middle">
+        {t.quotationPdfLink ? (
+          <a href={t.quotationPdfLink} target="_blank" rel="noreferrer" className="font-semibold text-primary underline hover:text-brand-800">
+            View
+          </a>
+        ) : (
+          "-"
+        )}
+      </td>
+    );
+  }
+  const text = cellText(key, t) || "-";
+  return (
+    <td key={key} className={`px-3.5 py-2 text-xs text-foreground align-middle ${key === "clientName" ? "font-semibold" : ""}`}>
+      <div className="max-w-[240px] truncate" title={text}>{text}</div>
+    </td>
+  );
+}
 
 const formatInputDate = (dateStr) => {
   if (!dateStr) return "";
@@ -29,7 +143,7 @@ const formatInputDate = (dateStr) => {
     return str;
   }
   
-  const match = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  const match = str.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
   if (match) {
     const day = match[1].padStart(2, "0");
     const month = match[2].padStart(2, "0");
@@ -40,7 +154,7 @@ const formatInputDate = (dateStr) => {
     return `${year}-${month}-${day}`;
   }
 
-  const matchY = str.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  const matchY = str.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/);
   if (matchY) {
     const year = matchY[1];
     const month = matchY[2].padStart(2, "0");
@@ -56,171 +170,51 @@ const formatInputDate = (dateStr) => {
       const day = String(date.getDate()).padStart(2, "0");
       return `${year}-${month}-${day}`;
     }
-  } catch (e) {}
+  } catch { /* unparseable date: fall through to "" */ }
   
   return "";
 };
 
 export default function TADA() {
-  const [activeTab, setActiveTab] = useState("pending");
   const [showTADAModal, setShowTADAModal] = useState(false);
   const [selectedTicket, setSelectedTicket] = useState(null);
   const [formData, setFormData] = useState({});
-  const [searchItem, setSearchItem] = useState("");
   const [isCancelled, setIsCancelled] = useState(false);
-
-  const [masterData, setMasterData] = useState({});
-
-  const [pendingData, setPendingData] = useState([]);
-  const [historyData, setHistoryData] = useState([]);
-  const [fetchLoading, setFetchLoading] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const { user } = useAuthStore();
 
-  // Tickets ready for TADA: sss_site_visit.tada_planned set (and not
-  // rescheduled — see the main app's Reschedule flow, migration 0054).
-  // Pending = no sss_tada row yet; History = row exists. Same shape as the
-  // main app's src/pages/TADA.jsx.
-  const fetchData = async () => {
-    setFetchLoading(true);
-    try {
-      const { data: siteVisitRows, error: siteVisitError } = await supabase
-        .from("sss_site_visit")
-        .select("ticket_id, ticket_uuid, engineer_assign, date_of_visit, transportation, tada_planned")
-        .not("tada_planned", "is", null)
-        .is("rescheduled_at", null)
-        .order("created_at", { ascending: false });
+  // Engineers only see tickets assigned to them; admins see everything and may cancel a ticket.
+  const isEngineer = user?.role === "ENGINEER";
+  const role = user?.role === "ADMIN" ? "admin" : "engineer";
+  const scope = useMemo(
+    () => (isEngineer ? scopeBy(["engineer_assign"], [user?.name, user?.id]) : null),
+    [isEngineer, user?.name, user?.id]
+  );
+  const list = useStageList({
+    key: "tada",
+    views: VIEWS,
+    scope,
+    scopeKey: isEngineer ? `eng:${user?.id}` : "all",
+    filters: FILTERS,
+    columns: COLUMNS,
+    order: ORDER,
+  });
 
-      if (siteVisitError) throw siteVisitError;
-
-      const ticketIds = [...new Set((siteVisitRows || []).map((s) => s.ticket_id))];
-
-      if (ticketIds.length === 0) {
-        setPendingData([]);
-        setHistoryData([]);
-        return;
-      }
-
-      const siteVisitByTicket = new Map((siteVisitRows || []).map((s) => [s.ticket_id, s]));
-
-      const [ticketsRes, warrantyRes, quotationRes, tadaRes] = await Promise.all([
-        supabase.from("sss_tickets").select("*").in("ticket_id", ticketIds).order("created_at", { ascending: true }),
-        supabase.from("sss_warranty_check").select("ticket_id, warranty_check").in("ticket_id", ticketIds),
-        supabase.from("sss_quotation").select("ticket_id, quotation_no, quotation_pdf_link").in("ticket_id", ticketIds),
-        supabase.from("sss_tada").select("*").in("ticket_id", ticketIds),
-      ]);
-
-      if (ticketsRes.error) throw ticketsRes.error;
-      if (warrantyRes.error) throw warrantyRes.error;
-      if (quotationRes.error) throw quotationRes.error;
-      if (tadaRes.error) throw tadaRes.error;
-
-      const warrantyByTicket = new Map((warrantyRes.data || []).map((w) => [w.ticket_id, w.warranty_check]));
-      const quotationByTicket = new Map((quotationRes.data || []).map((q) => [q.ticket_id, q]));
-      const tadaByTicket = new Map((tadaRes.data || []).map((t) => [t.ticket_id, t]));
-
-      const pending = [];
-      const history = [];
-
-      (ticketsRes.data || []).forEach((t) => {
-        const sv = siteVisitByTicket.get(t.ticket_id);
-        const q = quotationByTicket.get(t.ticket_id);
-
-        const base = {
-          id: t.uuid, // ticket_uuid — see handleSubmit below
-          timeStemp: t.created_at || "",
-          ticketId: t.ticket_id || "",
-          sourceOfEnquiry: t.source_of_enquiry || "",
-          callType: t.call_type || "",
-          enquiryReceiverName: t.enquiry_receiver_name || "",
-          clientType: t.client_type || "",
-          companyName: t.company_name || "",
-          clientName: t.client_name || "",
-          phoneNumber: t.phone_number || "",
-          gstAddress: t.gst_address || "",
-          siteAddress: t.site_address || "",
-          gstNo: t.gst_no || "",
-          machineName: t.machine_name || "",
-          category: t.category || "",
-          mentionIssue: t.mention_issue || "",
-          serviceLocation: t.service_location || "",
-          engineerAssign: sv?.engineer_assign || t.engineer_assign || "",
-          warrantyCheck: warrantyByTicket.get(t.ticket_id) || "",
-          siteName: t.site_address || "",
-          quotationNo: q?.quotation_no || "",
-          quotationPdfLink: q?.quotation_pdf_link || "",
-          dateOfVisit: sv?.date_of_visit || "",
-          transportation: sv?.transportation || "",
-          CREName: t.cre_name || "",
-        };
-
-        const tada = tadaByTicket.get(t.ticket_id);
-        if (tada) {
-          history.push({
-            ...base,
-            travelDate: tada.travel_date || "",
-            returnDate: tada.return_date || "",
-            destinationInput: tada.destination || "",
-            purposeOfTravel: tada.purpose_of_travel || "",
-            amount: tada.amount || "",
-            expectedCompletionDate: tada.expected_completion_date || "",
-            expectedCompletionTime: tada.expected_completion_time || "",
-            otpVerificationPlanned: tada.otp_verification_planned || "",
-            delayMinutes: tada.delay_minutes,
-          });
-        } else {
-          pending.push(base);
-        }
+  // Deep-link: /tada?ticketId=XXX opens that ticket's form. The ticket is looked up directly
+  // (it may not be on the first page of the list).
+  useEffect(() => {
+    const raw = new URLSearchParams(window.location.search).get("ticketId");
+    if (!raw) return;
+    window.history.replaceState({}, "", window.location.pathname); // clean the query param
+    supabase
+      .from(VIEWS.pending)
+      .select("*")
+      .eq("ticket_id", decodeURIComponent(raw))
+      .maybeSingle()
+      .then(({ data }) => {
+        if (data) handleTADAClick(mapRow(data));
       });
-
-      setPendingData(pending);
-      setHistoryData(history);
-    } catch (error) {
-      console.error("Error fetching data:", error);
-      toast.error("Failed to load data");
-    } finally {
-      setFetchLoading(false);
-    }
-  };
-
-  const fetchMasterSheet = async () => {
-    try {
-      const { data, error } = await supabase
-        .from("sss_dropdown")
-        .select("category, value")
-        .eq("category", "engineer_assign_name");
-
-      if (error) throw error;
-
-      const engineers = (data || []).map((row) => String(row.value || "").trim()).filter(Boolean);
-      setMasterData([{ "Engineer Assign Name": [...new Set(engineers)] }]);
-    } catch (error) {
-      console.error("Error fetching master data:", error);
-      toast.error("Failed to load master data");
-    }
-  };
-
-  useEffect(() => {
-    fetchMasterSheet();
-    fetchData();
   }, []);
-
-  // Auto-open modal when arriving via a TADA deep-link (e.g. /tada?ticketId=XXX)
-  useEffect(() => {
-    if (pendingData.length === 0) return;
-    const params = new URLSearchParams(window.location.search);
-    const ticketIdFromUrl = params.get("ticketId");
-    if (ticketIdFromUrl) {
-      const targetTicket = pendingData.find(
-        (t) => t.ticketId === decodeURIComponent(ticketIdFromUrl)
-      );
-      if (targetTicket) {
-        handleTADAClick(targetTicket);
-        // Clean the query param from the URL without reloading
-        const cleanUrl = window.location.pathname;
-        window.history.replaceState({}, "", cleanUrl);
-      }
-    }
-  }, [pendingData]);
 
   const handleTADAClick = (ticket) => {
     setSelectedTicket(ticket);
@@ -344,7 +338,7 @@ export default function TADA() {
 
       toast.success("Ticket details saved — sent for Senior Approval.");
       setShowTADAModal(false);
-      fetchData();
+      list.reload();
     } catch (error) {
       console.error("Error submitting ticket:", error);
       toast.error(error.message || "Failed to save ticket details");
@@ -370,11 +364,7 @@ export default function TADA() {
 
       if (error) throw error;
 
-      setPendingData((prevPending) =>
-        prevPending.filter(
-          (ticket) => ticket.ticketId !== selectedTicket.ticketId
-        )
-      );
+      list.reload(); // the cancelled ticket leaves Pending
       toast.success("Ticket details cancelled successfully");
       setShowTADAModal(false);
       setIsCancelled(false);
@@ -386,792 +376,121 @@ export default function TADA() {
     }
   };
 
-  const formatDate = (dateString) => {
-    if (!dateString) return "";
-
-    const date = new Date(dateString);
-    const day = String(date.getDate()).padStart(2, "0");
-    const month = String(date.getMonth() + 1).padStart(2, "0"); // Months are 0-indexed
-    const year = date.getFullYear();
-
-    return `${day}/${month}/${year}`;
-  };
-
-  const formatDateTime = (date) => {
-    const d = new Date(date);
-    const day = String(d.getDate()).padStart(2, "0");
-    const month = String(d.getMonth() + 1).padStart(2, "0");
-    const year = d.getFullYear();
-    const hours = String(d.getHours()).padStart(2, "0");
-    const minutes = String(d.getMinutes()).padStart(2, "0");
-    const seconds = String(d.getSeconds()).padStart(2, "0");
-
-    return `${day}/${month}/${year} ${hours}:${minutes}:${seconds}`;
-  };
-
-  const filteredPendingDataa = pendingData
-    .filter((item) => {
-      const q = searchItem.toLowerCase();
-      const matchesSearch =
-        String(item.ticketId || "").toLowerCase().includes(q) ||
-        String(item.clientName || "").toLowerCase().includes(q) ||
-        String(item.companyName || "").toLowerCase().includes(q) ||
-        String(item.phoneNumber || "").toLowerCase().includes(q);
-      return matchesSearch;
-    })
-    .reverse();
-
-  const filteredHistoryDataa = historyData
-    .filter((item) => {
-      const q = searchItem.toLowerCase();
-      const matchesSearch =
-        String(item.ticketId || "").toLowerCase().includes(q) ||
-        String(item.clientName || "").toLowerCase().includes(q) ||
-        String(item.companyName || "").toLowerCase().includes(q) ||
-        String(item.phoneNumber || "").toLowerCase().includes(q);
-      return matchesSearch;
-    })
-    .reverse();
-
-  const userName = localStorage.getItem("currentUsername") || "";
-
-  const roleStorage = localStorage.getItem("o2d-auth-storage");
-  const parsedData = roleStorage ? JSON.parse(roleStorage) : null;
-  const role = parsedData?.state?.user?.role || "";
-
-  const filteredPendingData = role === "user" ? filteredPendingDataa.filter(
-    (item) => item["CREName"] === userName
-  )
-    : role === "engineer" ? filteredPendingDataa.filter((item) => item["engineerAssign"] === userName)
-      : filteredPendingDataa;
-
-  const filteredHistoryData = role === "user" ? filteredHistoryDataa.filter(
-    (item) => item["CREName"] === userName
-  ) : role === "engineer" ? filteredHistoryDataa.filter((item) => item["engineerAssign"] === userName) : filteredHistoryDataa;
+  const isPending = list.tab === "pending";
+  const rows = useMemo(() => list.rows.map(mapRow), [list.rows]);
+  const headers = [...(isPending ? [{ label: "Action", className: "w-24" }] : []), ...list.activeColumns.map((c) => c.label)];
 
   return (
-    <div className="space-y-2">
-      <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-        <Card className="border-0 shadow-lg bg-gradient-to-br from-blue-50 to-indigo-50">
-          <CardHeader className="bg-gradient-to-r from-blue-50/50 to-indigo-50/50 rounded-t-lg border-b border-blue-100 px-6 py-4 flex flex-col md:flex-row justify-between items-center gap-4">
-            
-            {/* Left Side: Tabs buttons */}
-            <div className="flex flex-wrap items-center gap-4">
-              <TabsList className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200">
-                <TabsTrigger
-                  value="pending"
-                  data-testid="tab-pending"
-                  className="data-[state=active]:bg-blue-600 data-[state=active]:text-white"
-                >
-                  Pending ({filteredPendingData.length})
-                </TabsTrigger>
-                <TabsTrigger
-                  value="history"
-                  data-testid="tab-history"
-                  className="data-[state=active]:bg-blue-600 data-[state=active]:text-white"
-                >
-                  History ({filteredHistoryData.length})
-                </TabsTrigger>
-              </TabsList>
-            </div>
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      {/* One toolbar row */}
+      <div className="flex flex-wrap items-center gap-2">
+        <StatusTabs tabs={list.tabs} activeTab={list.tab} onChange={list.setTab} label="TADA views" />
+        <FilterSearch
+          value={list.search}
+          onChange={list.setSearch}
+          placeholder="Search ticket, client, company, phone..."
+          className="min-w-[220px] flex-1"
+        />
+        {FILTERS.map((f) => (
+          <select
+            key={f.key}
+            aria-label={f.label}
+            value={list.filterValues[f.key]}
+            onChange={(e) => list.setFilter(f.key, e.target.value)}
+            className={`${filterControlClass} !w-auto min-w-[140px] max-w-[200px]`}
+          >
+            <option value="all">{f.allLabel}</option>
+            {list.filterOptions[f.key].map((v) => (
+              <option key={v} value={v}>{v}</option>
+            ))}
+          </select>
+        ))}
+        <button
+          type="button"
+          onClick={list.reload}
+          disabled={list.fetching}
+          aria-label="Refresh"
+          className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-input bg-card text-sm text-foreground transition-colors hover:bg-accent disabled:opacity-50"
+        >
+          <RefreshCw className={`h-4 w-4 ${list.fetching ? "animate-spin" : ""}`} aria-hidden="true" />
+        </button>
+        <ColumnSelector {...list.columnPanel} />
+      </div>
+      <FilterChips chips={list.chips} onClearAll={list.clearAll} />
 
-            {/* Right Side: Search Input */}
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-4 flex-1 md:justify-end w-full md:w-auto">
-              <div className="relative flex-1 max-w-md w-full">
-                <Input
-                  id="searchFilter"
-                  placeholder="Search by ticket ID, client, company or phone..."
-                  className="pl-10 py-2 w-full rounded-md border-blue-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 bg-white"
-                  data-testid="input-search-filter"
-                  onChange={(e) => setSearchItem(e.target.value)}
-                />
-              </div>
-            </div>
-          </CardHeader>
-          <CardContent>
-            <div className="mt-2">
-              <TabsContent value="pending" className="mt-0">
-              <div className="relative overflow-x-auto">
-                <div className="max-h-[calc(103vh-200px)] overflow-y-auto">
-                  <table className="hidden sm:block w-full">
-                    <thead className="sticky top-0 z-10">
-                      <tr className="bg-gradient-to-r from-blue-600 to-indigo-600">
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[120px] sticky top-0">
-                          Action
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Date
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[120px] sticky top-0">
-                          Ticket ID
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Source of enquiry
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Call type
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[180px] sticky top-0">
-                          Enquiry Receiver Name
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Client Type
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[200px] sticky top-0">
-                          Company Name
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Client Name
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Phone Number
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[200px] sticky top-0">
-                          Billing Address
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[200px] sticky top-0">
-                          Site Address
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          GST No.
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Machine Name
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Category
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[200px] sticky top-0">
-                          Mention Issue
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Service Location
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Quotation No.
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Warranty Check
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Engineer Assign
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Site Name
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Date of Visit
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Transportation
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-center w-[120px] sticky top-0">
-                          Quotation PDF
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody className="bg-white divide-y divide-blue-100">
-                      {filteredPendingData.length === 0 ? (
-                        <tr>
-                          <td
-                            colSpan={24}
-                            className="text-center py-8 bg-white"
-                            data-testid="text-no-pending"
-                          >
-                            {fetchLoading ? (
-                              <div className="flex justify-center items-center text-blue-700">
-                                <LoaderIcon className="animate-spin w-8 h-8" />
-                              </div>
-                            ) : (
-                              <h1 className="text-blue-700">
-                                No pending TADA requests found.
-                              </h1>
-                            )}
-                          </td>
-                        </tr>
-                      ) : (
-                        filteredPendingData.map((ticket, ind) => (
-                          <tr
-                            key={ticket.id}
-                            className={
-                              ind % 2 === 0 ? "bg-blue-50/50" : "bg-white"
-                            }
-                          >
-                            <td className="px-4 py-3">
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="bg-gradient-to-br from-blue-50 to-indigo-50 text-blue-600 hover:from-blue-100 hover:to-indigo-100 hover:text-blue-700 transition-all duration-300 border border-blue-200 hover:border-blue-300 rounded-lg px-3 py-1.5 shadow-sm hover:shadow-md group"
-                                onClick={() => handleTADAClick(ticket)}
-                                data-testid={`button-tada-${ticket.ticketId}`}
-                              >
-                                <Eye className="w-4 h-4 mr-2 transition-all group-hover:scale-110 text-blue-500 group-hover:text-blue-600" />
-                                <span className="font-medium">TADA</span>
-                              </Button>
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {formatDate(ticket.timeStemp)}
-                            </td>
-                            <td className="px-4 py-3 font-medium text-blue-800">
-                              {ticket.ticketId}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.sourceOfEnquiry || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.callType || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.enquiryReceiverName || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.clientType || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.companyName || "-"}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.clientName}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.phoneNumber}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.gstAddress || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.siteAddress || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.gstNo || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.machineName || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.category || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.mentionIssue || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.serviceLocation || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.quotationNo ? String(ticket.quotationNo).replace(/^(Quotation|Quo|QUO|Quo\.)[:\-\s.]*/i, "").trim() : "-"}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.warrantyCheck}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.engineerAssign || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.siteName || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {formatDate(ticket.dateOfVisit) || ""}
-                            </td>
-                            <td className="px-4 py-3">
-                              <span className="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-blue-100 text-blue-800">
-                                {ticket.transportation || ""}
-                              </span>
-                            </td>
-                            <td className="px-4 py-3 text-center">
-                              {ticket.quotationPdfLink ? (
-                                <Button
-                                  variant="ghost"
-                                  size="sm"
-                                  className="text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-full p-1"
-                                  onClick={() => window.open(ticket.quotationPdfLink, "_blank")}
-                                  title="View Quotation PDF"
-                                >
-                                  <Eye className="w-5 h-5" />
-                                </Button>
-                              ) : (
-                                <span className="text-gray-400">-</span>
-                              )}
-                            </td>
-                          </tr>
-                        ))
-                      )}
-                    </tbody>
-                  </table>
-
-                  {/* Mobile Card View */}
-                  <div className="sm:hidden space-y-4">
-                    {filteredPendingData.length === 0 ? (
-                      <div
-                        className="text-center py-8 bg-white"
-                        data-testid="text-no-pending"
-                      >
-                        {fetchLoading ? (
-                          <div className="flex justify-center items-center text-blue-700">
-                            <LoaderIcon className="animate-spin w-8 h-8" />
-                          </div>
-                        ) : (
-                          <h1 className="text-blue-700">
-                            No pending TADA requests found.
-                          </h1>
-                        )}
-                      </div>
-                    ) : (
-                      filteredPendingData.map((ticket, ind) => (
-                        <Card
-                          key={ticket.id}
-                          className={`${ind % 2 === 0 ? "bg-blue-50/50" : "bg-white"
-                            } border-l-4 border-l-blue-500`}
-                        >
-                          <CardContent className="p-4 space-y-3">
-                            {/* Header with Ticket ID and Action */}
-                            <div className="flex justify-between items-start">
-                              <div>
-                                <h3 className="font-bold text-blue-800 text-lg">
-                                  {ticket.ticketId}
-                                </h3>
-                                <p className="text-sm text-gray-600">
-                                  {ticket.clientName}
-                                </p>
-                                <div className="mt-2 space-y-1 border-t border-gray-100 pt-2">
-                                  <p className="text-sm">
-                                    <span className="font-medium text-gray-500">Company:</span>{" "}
-                                    <span className="text-blue-700">{ticket.companyName || "N/A"}</span>
-                                  </p>
-                                  <p className="text-sm">
-                                    <span className="font-medium text-gray-500">Quotation No:</span>{" "}
-                                    <span className="text-blue-700">{ticket.quotationNo ? String(ticket.quotationNo).replace(/^(Quotation|Quo|QUO|Quo\.)[:\-\s.]*/i, "").trim() : "N/A"}</span>
-                                  </p>
-                                  {ticket.quotationPdfLink && (
-                                    <div className="flex items-center gap-2 mt-1">
-                                      <span className="text-sm font-medium text-gray-500">PDF:</span>
-                                      <Button
-                                        variant="link"
-                                        size="sm"
-                                        className="h-auto p-0 text-blue-600 font-medium flex items-center gap-1"
-                                        onClick={() => window.open(ticket.quotationPdfLink, "_blank")}
-                                      >
-                                        <Eye className="w-3 h-3" /> View
-                                      </Button>
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="bg-gradient-to-br from-blue-50 to-indigo-50 text-blue-600 hover:from-blue-100 hover:to-indigo-100 border border-blue-200"
-                                onClick={() => handleTADAClick(ticket)}
-                              >
-                                <Eye className="w-4 h-4 mr-1" />
-                                TADA
-                              </Button>
-                            </div>
-
-                            {/* Contact & Warranty Info */}
-                            <div className="grid grid-cols-2 gap-3 text-sm">
-                              <div>
-                                <p className="text-gray-500 font-medium">
-                                  Phone
-                                </p>
-                                <p className="text-blue-900">
-                                  {ticket.phoneNumber}
-                                </p>
-                              </div>
-                              <div>
-                                <p className="text-gray-500 font-medium">
-                                  Warranty
-                                </p>
-                                <p className="text-blue-900">
-                                  {ticket.warrantyCheck}
-                                </p>
-                              </div>
-                            </div>
-
-                            {/* Machine & Enquiry Details */}
-                            <div className="grid grid-cols-2 gap-3 text-sm">
-                              <div>
-                                <p className="text-gray-500 font-medium">
-                                  Machine
-                                </p>
-                                <p className="text-blue-900">
-                                  {ticket.machineName || "N/A"}
-                                </p>
-                              </div>
-                              <div>
-                                <p className="text-gray-500 font-medium">
-                                  Call Type
-                                </p>
-                                <p className="text-blue-900">
-                                  {ticket.callType || "N/A"}
-                                </p>
-                              </div>
-                            </div>
-
-                            {/* Engineer & Site */}
-                            <div className="grid grid-cols-2 gap-3 text-sm">
-                              <div>
-                                <p className="text-gray-500 font-medium">
-                                  Engineer
-                                </p>
-                                <p className="text-blue-900">
-                                  {ticket.engineerAssign || "N/A"}
-                                </p>
-                              </div>
-                              <div>
-                                <p className="text-gray-500 font-medium">
-                                  Site Name
-                                </p>
-                                <p className="text-blue-900">
-                                  {ticket.siteName || "N/A"}
-                                </p>
-                              </div>
-                            </div>
-
-                            {/* Visit Date & Transportation */}
-                            <div className="grid grid-cols-2 gap-3 text-sm">
-                              <div>
-                                <p className="text-gray-500 font-medium">
-                                  Visit Date
-                                </p>
-                                <p className="text-blue-900">
-                                  {formatDate(ticket.dateOfVisit) || "N/A"}
-                                </p>
-                              </div>
-                              <div>
-                                <p className="text-gray-500 font-medium">
-                                  Transportation
-                                </p>
-                                <span className="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-blue-100 text-blue-800">
-                                  {ticket.transportation || "N/A"}
-                                </span>
-                              </div>
-                            </div>
-                          </CardContent>
-                        </Card>
-                      ))
-                    )}
-                  </div>
+      <div className="min-h-0 flex-1">
+        <DataTable
+          ariaLabel={isPending ? "Pending TADA" : "TADA history"}
+          headers={headers}
+          data={rows}
+          loading={list.loading}
+          error={list.error}
+          onRetry={list.reload}
+          emptyTitle={list.chips.length ? "No tickets match these filters" : isPending ? "No pending TADA" : "No TADA history yet"}
+          currentPage={list.page}
+          totalPages={list.totalPages}
+          itemsPerPage={list.pageSize}
+          totalResults={list.total}
+          onPageChange={list.setPage}
+          onItemsPerPageChange={list.setPageSize}
+          itemsPerPageOptions={PAGE_SIZES}
+          minWidth="min-w-[900px]"
+          renderRow={(ticket) => (
+            <tr key={ticket.id}>
+              {isPending && (
+                <td className="px-3.5 py-2 align-middle">
+                  <button
+                    type="button"
+                    onClick={() => handleTADAClick(ticket)}
+                    data-testid={`button-tada-${ticket.ticketId}`}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
+                  >
+                    <Car size={13} aria-hidden="true" />
+                    TADA
+                  </button>
+                </td>
+              )}
+              {list.activeColumns.map((c) => renderCell(c.key, ticket))}
+            </tr>
+          )}
+          renderCard={(ticket) => (
+            <div key={ticket.id} className="space-y-2 rounded-lg border bg-card p-3 text-xs shadow-sm">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <span className="rounded bg-secondary px-1.5 py-0.5 font-mono font-semibold">{ticket.ticketId}</span>
+                  <p className="mt-1 text-muted-foreground">{formatDisplayDate(ticket.timeStemp)}</p>
                 </div>
+                {isPending && (
+                  <button
+                    type="button"
+                    onClick={() => handleTADAClick(ticket)}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 font-semibold text-primary-foreground"
+                  >
+                    <Car size={13} aria-hidden="true" />
+                    TADA
+                  </button>
+                )}
               </div>
-            </TabsContent>
-
-            <TabsContent value="history" className="mt-0">
-              <div className="relative overflow-x-auto">
-                <div className="max-h-[calc(103vh-200px)] overflow-y-auto">
-                  <table className="hidden sm:block w-full">
-                    <thead className="sticky top-0 z-10">
-                      <tr className="bg-gradient-to-r from-blue-600 to-indigo-600">
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Date
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[120px] sticky top-0">
-                          Ticket ID
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Source of enquiry
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Call type
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[180px] sticky top-0">
-                          Enquiry Receiver Name
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Client Type
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[200px] sticky top-0">
-                          Company Name
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Client Name
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Phone Number
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[200px] sticky top-0">
-                          Billing Address
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[200px] sticky top-0">
-                          Site Address
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          GST No.
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Machine Name
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Category
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[200px] sticky top-0">
-                          Mention Issue
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Service Location
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Quotation No.
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Engineer Assign
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Travel Date
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Return Date
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Destination
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Purpose
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-left w-[150px] sticky top-0">
-                          Amount
-                        </th>
-                        <th className="text-white border-b border-blue-500 px-4 py-3 text-center w-[120px] sticky top-0">
-                          Quotation PDF
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody className="bg-white divide-y divide-blue-100">
-                      {filteredHistoryData.length === 0 ? (
-                        <tr>
-                          <td
-                            colSpan={24}
-                            className="text-center py-8 bg-white"
-                            data-testid="text-no-history"
-                          >
-                            {fetchLoading ? (
-                              <div className="flex justify-center items-center text-blue-700">
-                                <LoaderIcon className="animate-spin w-8 h-8" />
-                              </div>
-                            ) : (
-                              <h1 className="text-blue-700">
-                                No TADA history found.
-                              </h1>
-                            )}
-                          </td>
-                        </tr>
-                      ) : (
-                        filteredHistoryData.map((ticket, ind) => (
-                          <tr
-                            key={ind}
-                            className={
-                              ind % 2 === 0 ? "bg-blue-50/50" : "bg-white"
-                            }
-                          >
-                            <td className="px-4 py-3 text-blue-900">
-                              {formatDate(ticket.timeStemp)}
-                            </td>
-                            <td className="px-4 py-3 font-medium text-blue-800">
-                              {ticket.ticketId}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.sourceOfEnquiry || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.callType || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.enquiryReceiverName || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.clientType || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.companyName || "-"}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.clientName}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.phoneNumber}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.gstAddress || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.siteAddress || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.gstNo || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.machineName || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.category || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.mentionIssue || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.serviceLocation || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.quotationNo ? String(ticket.quotationNo).replace(/^(Quotation|Quo|QUO|Quo\.)[:\-\s.]*/i, "").trim() : "-"}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.engineerAssign || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {formatDate(ticket.travelDate) || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {formatDate(ticket.returnDate) || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.destinationInput || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              {ticket.purposeOfTravel || ""}
-                            </td>
-                            <td className="px-4 py-3 text-blue-900">
-                              ₹{ticket.amount || "0"}
-                            </td>
-                            <td className="px-4 py-3 text-center">
-                              {ticket.quotationPdfLink ? (
-                                <Button
-                                  variant="ghost"
-                                  size="sm"
-                                  className="text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-full p-1"
-                                  onClick={() => window.open(ticket.quotationPdfLink, "_blank")}
-                                  title="View Quotation PDF"
-                                >
-                                  <Eye className="w-5 h-5" />
-                                </Button>
-                              ) : (
-                                <span className="text-gray-400">-</span>
-                              )}
-                            </td>
-                          </tr>
-                        ))
-                      )}
-                    </tbody>
-                  </table>
-
-                  {/* Mobile Card View */}
-                  <div className="sm:hidden space-y-4">
-                    {filteredHistoryData.length === 0 ? (
-                      <div
-                        className="text-center py-8 bg-white"
-                        data-testid="text-no-history"
-                      >
-                        {fetchLoading ? (
-                          <div className="flex justify-center items-center text-blue-700">
-                            <LoaderIcon className="animate-spin w-8 h-8" />
-                          </div>
+              <dl className="grid grid-cols-2 gap-x-3 gap-y-2 border-t pt-2">
+                {list.activeColumns
+                  .filter((c) => !["ticketId", "timeStemp"].includes(c.key) && cellText(c.key, ticket))
+                  .map((c) => (
+                    <div key={c.key} className={WIDE_KEYS.includes(c.key) ? "col-span-2" : ""}>
+                      <dt className="text-muted-foreground">{c.label}</dt>
+                      <dd className="break-words font-medium">
+                        {c.key === "quotationPdfLink" ? (
+                          <a href={ticket.quotationPdfLink} target="_blank" rel="noreferrer" className="font-semibold text-primary underline">View</a>
                         ) : (
-                          <h1 className="text-blue-700">
-                            No TADA history found.
-                          </h1>
+                          cellText(c.key, ticket)
                         )}
-                      </div>
-                    ) : (
-                      filteredHistoryData.map((ticket, ind) => (
-                        <Card
-                          key={ind}
-                          className={`${ind % 2 === 0 ? "bg-blue-50/50" : "bg-white"
-                            } border-l-4 border-l-blue-500`}
-                        >
-                          <CardContent className="p-4 space-y-3">
-                            {/* Header */}
-                            <div>
-                              <h3 className="font-bold text-blue-800 text-lg">
-                                {ticket.ticketId}
-                              </h3>
-                              <p className="text-sm text-gray-600">
-                                {ticket.clientName}
-                              </p>
-                              <div className="mt-2 space-y-1 border-t border-gray-100 pt-2 text-sm">
-                                <p><span className="font-medium text-gray-500">Company:</span> <span className="text-blue-700">{ticket.companyName || "N/A"}</span></p>
-                                <p><span className="font-medium text-gray-500">Quotation No:</span> <span className="text-blue-700">{ticket.quotationNo ? String(ticket.quotationNo).replace(/^(Quotation|Quo|QUO|Quo\.)[:\-\s.]*/i, "").trim() : "N/A"}</span></p>
-                                {ticket.quotationPdfLink && (
-                                  <Button
-                                    variant="link"
-                                    size="sm"
-                                    className="p-0 h-auto text-blue-600 font-medium flex items-center gap-1 mt-1"
-                                    onClick={() => window.open(ticket.quotationPdfLink, "_blank")}
-                                  >
-                                    <Eye className="w-3 h-3" /> View Quotation
-                                  </Button>
-                                )}
-                              </div>
-                            </div>
-
-                            {/* Engineer & Amount */}
-                            <div className="grid grid-cols-2 gap-3 text-sm">
-                              <div>
-                                <p className="text-gray-500 font-medium">
-                                  Engineer
-                                </p>
-                                <p className="text-blue-900">
-                                  {ticket.engineerAssign || "N/A"}
-                                </p>
-                              </div>
-                              <div>
-                                <p className="text-gray-500 font-medium">
-                                  Amount
-                                </p>
-                                <p className="text-blue-900 font-semibold">
-                                  ₹{ticket.amount || "0"}
-                                </p>
-                              </div>
-                            </div>
-
-                            {/* Travel Dates */}
-                            <div className="grid grid-cols-2 gap-3 text-sm">
-                              <div>
-                                <p className="text-gray-500 font-medium">
-                                  Travel Date
-                                </p>
-                                <p className="text-blue-900">
-                                  {formatDate(ticket.travelDate) || "N/A"}
-                                </p>
-                              </div>
-                              <div>
-                                <p className="text-gray-500 font-medium">
-                                  Return Date
-                                </p>
-                                <p className="text-blue-900">
-                                  {formatDate(ticket.returnDate) || "N/A"}
-                                </p>
-                              </div>
-                            </div>
-
-                            {/* Destination */}
-                            <div>
-                              <p className="text-gray-500 font-medium text-sm">
-                                Destination
-                              </p>
-                              <p className="text-blue-900">
-                                {ticket.destinationInput || "N/A"}
-                              </p>
-                            </div>
-
-                            {/* Purpose */}
-                            <div>
-                              <p className="text-gray-500 font-medium text-sm">
-                                Purpose of Travel
-                              </p>
-                              <p className="text-blue-900 line-clamp-2">
-                                {ticket.purposeOfTravel || "N/A"}
-                              </p>
-                            </div>
-                          </CardContent>
-                        </Card>
-                      ))
-                    )}
-                  </div>
-                </div>
-              </div>
-            </TabsContent>
-          </div>
-        </CardContent>
-      </Card>
-    </Tabs>
+                      </dd>
+                    </div>
+                  ))}
+              </dl>
+            </div>
+          )}
+        />
+      </div>
 
       {/* TADA Modal */}
       <Modal

@@ -18,8 +18,10 @@ export default function ModalWrapper({ isOpen, onClose, title, children, maxWidt
         <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100 bg-slate-50">
           <h3 className="text-base font-bold text-slate-800">{title}</h3>
           <button
+            type="button"
+            aria-label="Close"
             onClick={onClose}
-            className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-200 transition-colors"
+            className="p-1.5 text-slate-500 hover:text-slate-700 rounded-lg hover:bg-slate-200 transition-colors"
           >
             <X size={18} />
           </button>

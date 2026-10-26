@@ -1,112 +1,104 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import {
-  Search,
-  RefreshCw,
-  Wrench,
-  Loader2,
-  FileText,
-  Plus,
-  Trash2
-} from 'lucide-react';
-import TableWrapper from '../../components/TableWrapper';
+import { RefreshCw, Wrench, Plus, Trash2, Loader2 } from 'lucide-react';
 import ModalWrapper from '../../components/ModalWrapper';
+import { StatusTabs, FilterSearch, FilterChips, ColumnSelector, DataTable, StatusBadge, filterControlClass } from '../../components/shared';
 import formatDate from '../../utils/formatDate';
 import toast from 'react-hot-toast';
 import { useAuthStore } from '../../store/authStore';
 import { supabase } from '../../lib/supabase/client';
+import { useStageList, PAGE_SIZES } from '../../hooks/use-stage-list';
+import { scopeBy } from '../../lib/pagedView';
 
-const toBase64 = (file) => new Promise((resolve, reject) => {
-  const reader = new FileReader();
-  reader.readAsDataURL(file);
-  reader.onload = () => resolve(reader.result);
-  reader.onerror = error => reject(error);
+// Pending / History come from flat SQL views (Database/01_repair_status_views.sql):
+// search, filters, engineer scope and counts all run in SQL, one page per request.
+const VIEWS = { pending: 'engg_v_repair_status_pending', history: 'engg_v_repair_status_history' };
+const FILTERS = [
+  { key: 'serviceLocation', column: 'service_location', label: 'Location', allLabel: 'All Locations' },
+  { key: 'category', column: 'category', label: 'Category', allLabel: 'All Categories' },
+];
+const COLUMNS = [
+  { key: 'ticketId', label: 'Ticket ID' },
+  { key: 'date', label: 'Date' },
+  { key: 'clientName', label: 'Client Name' },
+  { key: 'companyName', label: 'Company Name' },
+  { key: 'machineName', label: 'Machine Name' },
+  { key: 'mentionIssue', label: 'Mention Issue' },
+  { key: 'serviceLocation', label: 'Service Location' },
+  { key: 'repairStatus', label: 'Repair Status', tabs: ['history'] },
+  { key: 'engineerName', label: 'Engineer Name', tabs: ['history'] },
+  { key: 'remarks', label: 'Remarks' },
+];
+const ORDER = {
+  pending: [{ column: 'created_at', ascending: true }],
+  history: [{ column: 'created_at', ascending: false }],
+};
+
+// View row -> the shape the row renderers and ProcessModal already use.
+// `id` stays the sss_warehouse row id (the FK target for engg_dsb_repair_status).
+const mapRow = (r) => ({
+  id: r.id,
+  timeStemp: r.ticket_created_at || '',
+  ticketId: r.ticket_id || '',
+  clientName: r.client_name || '',
+  phoneNumber: r.phone_number || '',
+  companyName: r.company_name || '',
+  machineName: r.machine_name || '',
+  mentionIssue: r.mention_issue || '',
+  category: r.category || '',
+  serviceLocation: r.service_location || '',
+  repairStatus: r.repair_status || '',
+  engineerName: r.engineer_name || '',
+  remarks: r.remarks || '',
+  assignedEngineer: r.assigned_engineer || '',
 });
 
+const Cell = ({ children, title, className = '' }) => (
+  <td className={`px-3.5 py-2 text-xs text-foreground align-middle ${className}`}>
+    <div className="max-w-[260px] truncate" title={title ?? (typeof children === 'string' ? children : undefined)}>
+      {children}
+    </div>
+  </td>
+);
+
+function renderCell(key, t) {
+  switch (key) {
+    case 'ticketId':
+      return <td key={key} className="px-3.5 py-2 whitespace-nowrap align-middle"><span className="rounded bg-secondary px-1.5 py-0.5 font-mono text-xs font-semibold text-foreground">{t.ticketId}</span></td>;
+    case 'date':
+      return <Cell key={key}>{formatDate(t.timeStemp)}</Cell>;
+    case 'clientName':
+      return <Cell key={key} className="font-semibold">{t.clientName || '-'}</Cell>;
+    case 'repairStatus':
+      return (
+        <td key={key} className="px-3.5 py-2 align-middle">
+          <StatusBadge tone={t.repairStatus === 'Yes' ? 'success' : 'danger'}>{t.repairStatus === 'Yes' ? 'Repaired' : 'Not repaired'}</StatusBadge>
+        </td>
+      );
+    default:
+      return <Cell key={key}>{t[key] || '-'}</Cell>;
+  }
+}
+
 export default function RepairStatus() {
-  const [activeTab, setActiveTab] = useState('pending');
-  const [tickets, setTickets] = useState([]);
-  const [engineerList, setEngineerList] = useState([]);
-  const [fetchLoading, setFetchLoading] = useState(false);
-  const [searchTerm, setSearchTerm] = useState('');
   const [selectedTicket, setSelectedTicket] = useState(null);
+  const [engineerList, setEngineerList] = useState([]);
   const { user } = useAuthStore();
 
-  // Tickets ready for the Engineer-Dashboard's own "Repair Status" stage:
-  // sss_warehouse.engg_dsb_repair_status_planned set by the main app's
-  // Warehouse.jsx at insert time. Pending = no matching
-  // engg_dsb_repair_status row yet; History = a row exists. See migration
-  // 0055.
-  const loadTickets = async () => {
-    setFetchLoading(true);
-    try {
-      const { data: warehouseRows, error: warehouseError } = await supabase
-        .from('sss_warehouse')
-        .select('*')
-        .not('engg_dsb_repair_status_planned', 'is', null)
-        .order('created_at', { ascending: true });
-
-      if (warehouseError) throw warehouseError;
-
-      const ticketIds = [...new Set((warehouseRows || []).map((w) => w.ticket_id))];
-      const warehouseIds = (warehouseRows || []).map((w) => w.id);
-
-      if (warehouseIds.length === 0) {
-        setTickets([]);
-        return;
-      }
-
-      const [ticketsRes, completionsRes] = await Promise.all([
-        supabase.from('sss_tickets').select('*').in('ticket_id', ticketIds),
-        supabase.from('engg_dsb_repair_status').select('*').in('warehouse_id', warehouseIds),
-      ]);
-
-      if (ticketsRes.error) throw ticketsRes.error;
-      if (completionsRes.error) throw completionsRes.error;
-
-      const ticketByTicketId = new Map((ticketsRes.data || []).map((t) => [t.ticket_id, t]));
-      const completionByWarehouse = new Map(
-        (completionsRes.data || []).map((c) => [c.warehouse_id, c])
-      );
-
-      const allTickets = (warehouseRows || []).map((w) => {
-        const t = ticketByTicketId.get(w.ticket_id) || {};
-        const completion = completionByWarehouse.get(w.id);
-        return {
-          id: w.id, // this stage's own row id (sss_warehouse.id), not the ticket
-          timeStemp: String(t.created_at || "").trim(),
-          ticketId: String(w.ticket_id || "").trim(),
-          clientName: String(t.client_name || "").trim(),
-          phoneNumber: String(t.phone_number || "").trim(),
-          companyName: String(t.company_name || "").trim(),
-          machineName: String(t.machine_name || "").trim(),
-          mentionIssue: String(t.mention_issue || "").trim(),
-          category: String(t.category || "").trim(),
-          serviceLocation: String(t.service_location || "").trim(),
-          planned: String(w.engg_dsb_repair_status_planned || "").trim(),
-          actual: completion ? String(completion.created_at || "").trim() : "",
-          repairStatus: completion ? String(completion.repair_status || "").trim() : "",
-          engineerName: completion ? String(completion.engineer_name || "").trim() : "",
-          remarks: completion ? String(completion.remarks || "").trim() : "",
-          assignedEngineer: String(w.assigned_engineer || "").trim(),
-        };
-      });
-
-      // Apply RBAC: if engineer, only see their assigned tickets
-      const filteredByRole = user?.role === 'ENGINEER'
-        ? allTickets.filter(t =>
-            t.assignedEngineer.toLowerCase() === user.name.toLowerCase() ||
-            t.assignedEngineer.toLowerCase() === user.id.toLowerCase()
-          )
-        : allTickets;
-
-      setTickets(filteredByRole);
-    } catch (error) {
-      console.error("Error loading Repair Status data:", error);
-      toast.error("Failed to load live data");
-    } finally {
-      setFetchLoading(false);
-    }
-  };
+  // Engineers only see tickets assigned to them (name or id); admins see all.
+  const isEngineer = user?.role === 'ENGINEER';
+  const scope = useMemo(
+    () => (isEngineer ? scopeBy(['assigned_engineer'], [user?.name, user?.id]) : null),
+    [isEngineer, user?.name, user?.id]
+  );
+  const list = useStageList({
+    key: 'repair-status',
+    views: VIEWS,
+    scope,
+    scopeKey: isEngineer ? `eng:${user?.id}` : 'all',
+    filters: FILTERS,
+    columns: COLUMNS,
+    order: ORDER,
+  });
 
   const fetchDropdownData = async () => {
     try {
@@ -126,341 +118,120 @@ export default function RepairStatus() {
     }
   };
 
+  const { reload } = list;
   useEffect(() => {
-    loadTickets();
     fetchDropdownData();
-    const handleRefresh = () => loadTickets();
+    const handleRefresh = () => reload();
     window.addEventListener('refresh_sales', handleRefresh);
     return () => window.removeEventListener('refresh_sales', handleRefresh);
-  }, []);
+  }, [reload]);
 
-  const pendingTickets = useMemo(() => {
-    return tickets.filter(t => t.planned !== "" && t.actual === "");
-  }, [tickets]);
-
-  const historyTickets = useMemo(() => {
-    return tickets.filter(t => t.planned !== "" && t.actual !== "");
-  }, [tickets]);
-
-  const filteredTickets = useMemo(() => {
-    const activeList = activeTab === 'pending' ? pendingTickets : historyTickets;
-    const searchLower = searchTerm.toLowerCase().trim();
-    if (!searchLower) return activeList;
-
-    return activeList.filter(t => 
-      t.ticketId.toLowerCase().includes(searchLower) ||
-      t.clientName.toLowerCase().includes(searchLower) ||
-      t.companyName.toLowerCase().includes(searchLower) ||
-      t.remarks.toLowerCase().includes(searchLower)
-    );
-  }, [activeTab, pendingTickets, historyTickets, searchTerm]);
+  const isPending = list.tab === 'pending';
+  const rows = useMemo(() => list.rows.map(mapRow), [list.rows]);
+  const headers = [...(isPending ? ['Action'] : []), ...list.activeColumns.map((c) => c.label)];
 
   return (
-    <div className="space-y-5 flex-1 flex flex-col min-h-0 overflow-hidden pr-1">
-      {/* Header and Filters */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 bg-white border border-slate-200 p-4 rounded-xl shadow-sm">
-        {/* Tab Selector */}
-        <div className="flex border border-slate-250 bg-slate-50/50 p-1 rounded-xl gap-1">
-          <button
-            onClick={() => setActiveTab('pending')}
-            className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all ${
-              activeTab === 'pending'
-                ? 'bg-indigo-600 text-white shadow-sm'
-                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'
-            }`}
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      {/* One toolbar row */}
+      <div className="flex flex-wrap items-center gap-2">
+        <StatusTabs tabs={list.tabs} activeTab={list.tab} onChange={list.setTab} label="Repair status views" />
+        <FilterSearch
+          value={list.search}
+          onChange={list.setSearch}
+          placeholder="Search ticket, client, company, machine..."
+          className="min-w-[220px] flex-1"
+        />
+        {FILTERS.map((f) => (
+          <select
+            key={f.key}
+            aria-label={f.label}
+            value={list.filterValues[f.key]}
+            onChange={(e) => list.setFilter(f.key, e.target.value)}
+            className={`${filterControlClass} !w-auto min-w-[140px] max-w-[200px]`}
           >
-            Pending ({pendingTickets.length})
-          </button>
-          <button
-            onClick={() => setActiveTab('history')}
-            className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all ${
-              activeTab === 'history'
-                ? 'bg-indigo-600 text-white shadow-sm'
-                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'
-            }`}
-          >
-            History ({historyTickets.length})
-          </button>
-        </div>
-
-        {/* Search and Refresh */}
-        <div className="flex items-center gap-3">
-          <div className="relative w-full sm:w-60">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-400" />
-            <input
-              type="text"
-              placeholder="Search by ID, Client, Company..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="block w-full pl-9 pr-3 py-1.5 text-xs bg-slate-50/50 border border-slate-200 rounded-lg text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:bg-white transition-all"
-            />
-          </div>
-          <button
-            onClick={loadTickets}
-            disabled={fetchLoading}
-            className="p-1.5 border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed text-slate-600 transition-colors"
-          >
-            <RefreshCw className={`h-4 w-4 ${fetchLoading ? "animate-spin" : ""}`} />
-          </button>
-        </div>
+            <option value="all">{f.allLabel}</option>
+            {list.filterOptions[f.key].map((v) => (
+              <option key={v} value={v}>{v}</option>
+            ))}
+          </select>
+        ))}
+        <button
+          type="button"
+          onClick={list.reload}
+          disabled={list.fetching}
+          aria-label="Refresh"
+          className="inline-flex h-9 items-center justify-center rounded-md border border-input bg-card w-9 text-sm text-foreground transition-colors hover:bg-accent disabled:opacity-50"
+        >
+          <RefreshCw className={`h-4 w-4 ${list.fetching ? 'animate-spin' : ''}`} aria-hidden="true" />
+        </button>
+        <ColumnSelector {...list.columnPanel} />
       </div>
+      <FilterChips chips={list.chips} onClearAll={list.clearAll} />
 
-      {/* Table Section */}
-      <div className="flex-1 min-h-0 flex flex-col justify-between gap-4">
-        <TableWrapper
-          headers={
-            activeTab === 'pending'
-              ? [
-                  'Action',
-                  'Ticket ID',
-                  'Date',
-                  'Client Name',
-                  'Company Name',
-                  'Machine Name',
-                  'Mention Issue',
-                  'Service Location',
-                  'Remarks'
-                ]
-              : [
-                  'Ticket ID',
-                  'Date',
-                  'Client Name',
-                  'Company Name',
-                  'Machine Name',
-                  'Mention Issue',
-                  'Service Location',
-                  'Repair Status',
-                  'Engineer Name',
-                  'Remarks'
-                ]
-          }
-          data={filteredTickets}
-          emptyMessage={
-            fetchLoading ? (
-              <div className="flex items-center justify-center flex-col py-6">
-                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500"></div>
-                <p className="mt-2 text-xs text-slate-500 font-medium">Loading records...</p>
+      <div className="min-h-0 flex-1">
+        <DataTable
+          ariaLabel={isPending ? 'Pending repairs' : 'Repair history'}
+          headers={headers}
+          data={rows}
+          loading={list.loading}
+          error={list.error}
+          onRetry={list.reload}
+          emptyTitle={list.chips.length ? 'No repairs match these filters' : isPending ? 'No pending repairs' : 'No repair history yet'}
+          currentPage={list.page}
+          totalPages={list.totalPages}
+          itemsPerPage={list.pageSize}
+          totalResults={list.total}
+          onPageChange={list.setPage}
+          onItemsPerPageChange={list.setPageSize}
+          itemsPerPageOptions={PAGE_SIZES}
+          renderRow={(ticket) => (
+            <tr key={ticket.id} className="transition-colors">
+              {isPending && (
+                <td className="px-3.5 py-2 align-middle">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedTicket(ticket)}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
+                  >
+                    <Wrench size={13} aria-hidden="true" />
+                    Process
+                  </button>
+                </td>
+              )}
+              {list.activeColumns.map((c) => renderCell(c.key, ticket))}
+            </tr>
+          )}
+          renderCard={(ticket) => (
+            <div key={ticket.id} className="space-y-2 rounded-lg border bg-card p-3 text-xs shadow-sm">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <span className="rounded bg-secondary px-1.5 py-0.5 font-mono font-semibold">{ticket.ticketId}</span>
+                  <p className="mt-1 text-muted-foreground">{formatDate(ticket.timeStemp)}</p>
+                </div>
+                {isPending ? (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedTicket(ticket)}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 font-semibold text-primary-foreground"
+                  >
+                    <Wrench size={13} aria-hidden="true" />
+                    Process
+                  </button>
+                ) : (
+                  <StatusBadge tone={ticket.repairStatus === 'Yes' ? 'success' : 'danger'}>{ticket.repairStatus === 'Yes' ? 'Repaired' : 'Not repaired'}</StatusBadge>
+                )}
               </div>
-            ) : "No entries found."
-          }
-          renderCard={(ticket) => {
-            if (activeTab === 'pending') {
-              return (
-                <div key={ticket.id} className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 space-y-3 relative border-l-4 border-l-blue-500">
-                  {/* Top Right Action Button */}
-                  <div className="absolute top-4 right-4">
-                    <button
-                      onClick={() => setSelectedTicket(ticket)}
-                      className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm flex items-center gap-1"
-                    >
-                      <Wrench size={12} />
-                      Process
-                    </button>
-                  </div>
-
-                  {/* Header / Info */}
-                  <div className="pr-24">
-                    <span className="text-[10px] font-mono font-bold bg-slate-100 px-1.5 py-0.5 rounded text-slate-700">
-                      {ticket.ticketId}
-                    </span>
-                    <p className="text-[11px] text-slate-500 mt-1">
-                      {formatDate(ticket.timeStemp)}
-                    </p>
-                  </div>
-
-                  <div className="pt-2 border-t border-slate-100 space-y-2 text-xs">
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <p className="text-slate-500 font-medium">Client Name</p>
-                        <p className="text-slate-800 font-semibold">{ticket.clientName || "N/A"}</p>
-                      </div>
-                      <div>
-                        <p className="text-slate-500 font-medium">Company Name</p>
-                        <p className="text-slate-800 font-semibold">{ticket.companyName || "N/A"}</p>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-3 pt-1">
-                      <div>
-                        <p className="text-slate-500 font-medium">Machine Name</p>
-                        <p className="text-slate-800">{ticket.machineName || "N/A"}</p>
-                      </div>
-                      <div>
-                        <p className="text-slate-500 font-medium">Service Location</p>
-                        <p className="text-slate-800">{ticket.serviceLocation || "N/A"}</p>
-                      </div>
-                    </div>
-
-                    <div className="pt-1">
-                      <p className="text-slate-500 font-medium">Mention Issue</p>
-                      <p className="text-slate-700">{ticket.mentionIssue || "N/A"}</p>
-                    </div>
-
-                    {ticket.remarks && (
-                      <div className="bg-slate-50 p-2 rounded-lg text-slate-600 mt-1">
-                        <p className="text-slate-500 font-medium text-[10px]">Remarks</p>
-                        <p className="text-[11px] italic">{ticket.remarks}</p>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              );
-            } else {
-              const statusBorder = ticket.repairStatus === "Yes" ? "border-l-emerald-500" : "border-l-rose-500";
-              return (
-                <div key={ticket.id} className={`bg-white rounded-xl border border-slate-200 shadow-sm p-4 space-y-3 relative border-l-4 ${statusBorder}`}>
-                  {/* Header / Info */}
-                  <div>
-                    <span className="text-[10px] font-mono font-bold bg-slate-100 px-1.5 py-0.5 rounded text-slate-700">
-                      {ticket.ticketId}
-                    </span>
-                    <p className="text-[11px] text-slate-500 mt-1">
-                      {formatDate(ticket.timeStemp)}
-                    </p>
-                  </div>
-
-                  <div className="pt-2 border-t border-slate-100 space-y-2 text-xs">
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <p className="text-slate-500 font-medium">Client Name</p>
-                        <p className="text-slate-800 font-semibold">{ticket.clientName || "N/A"}</p>
-                      </div>
-                      <div>
-                        <p className="text-slate-500 font-medium">Company Name</p>
-                        <p className="text-slate-800 font-semibold">{ticket.companyName || "N/A"}</p>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-3 pt-1">
-                      <div>
-                        <p className="text-slate-500 font-medium">Machine Name</p>
-                        <p className="text-slate-800">{ticket.machineName || "N/A"}</p>
-                      </div>
-                      <div>
-                        <p className="text-slate-500 font-medium">Service Location</p>
-                        <p className="text-slate-800">{ticket.serviceLocation || "N/A"}</p>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-3 pt-1">
-                      <div>
-                        <p className="text-slate-500 font-medium">Engineer Name</p>
-                        <p className="text-slate-800 font-semibold">{ticket.engineerName || "N/A"}</p>
-                      </div>
-                      <div>
-                        <p className="text-slate-500 font-medium">Repair Status</p>
-                        <span className={`inline-block px-2.5 py-0.5 rounded-full font-semibold border text-[10px] ${
-                          ticket.repairStatus === "Yes"
-                            ? "bg-emerald-50 text-emerald-700 border-emerald-100"
-                            : "bg-rose-50 text-rose-700 border-rose-100"
-                        }`}>
-                          {ticket.repairStatus === "Yes" ? "Repaired" : "Pending"}
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="pt-1">
-                      <p className="text-slate-500 font-medium">Mention Issue</p>
-                      <p className="text-slate-700">{ticket.mentionIssue || "N/A"}</p>
-                    </div>
-
-                    {ticket.remarks && (
-                      <div className="bg-slate-50 p-2 rounded-lg text-slate-600 mt-1">
-                        <p className="text-slate-500 font-medium text-[10px]">Remarks</p>
-                        <p className="text-[11px] italic">{ticket.remarks}</p>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              );
-            }
-          }}
-          renderRow={(ticket) => {
-            if (activeTab === 'pending') {
-              return (
-                <tr key={ticket.id} className="hover:bg-indigo-50/30 transition-colors">
-                  <td className="px-5 py-3.5">
-                    <button
-                      onClick={() => setSelectedTicket(ticket)}
-                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm flex items-center gap-1.5"
-                    >
-                      <Wrench size={13} />
-                      Process
-                    </button>
-                  </td>
-                  <td className="px-5 py-3.5 whitespace-nowrap">
-                    <span className="text-xs font-mono font-bold bg-slate-100 px-1.5 py-0.5 rounded text-slate-700">
-                      {ticket.ticketId}
-                    </span>
-                  </td>
-                  <td className="px-5 py-3.5 whitespace-nowrap text-xs text-slate-600">
-                    {formatDate(ticket.timeStemp)}
-                  </td>
-                  <td className="px-5 py-3.5 text-xs font-bold text-slate-800">
-                    {ticket.clientName}
-                  </td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600">
-                    {ticket.companyName}
-                  </td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600">
-                    {ticket.machineName || "-"}
-                  </td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600">
-                    {ticket.mentionIssue || "-"}
-                  </td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600">
-                    {ticket.serviceLocation}
-                  </td>
-                  <td className="px-5 py-3.5 text-xs text-slate-500 max-w-[180px] truncate" title={ticket.remarks}>
-                    {ticket.remarks || "-"}
-                  </td>
-                </tr>
-              );
-            } else {
-              return (
-                <tr key={ticket.id} className="hover:bg-indigo-50/30 transition-colors">
-                  <td className="px-5 py-3.5 whitespace-nowrap">
-                    <span className="text-xs font-mono font-bold bg-slate-100 px-1.5 py-0.5 rounded text-slate-700">
-                      {ticket.ticketId}
-                    </span>
-                  </td>
-                  <td className="px-5 py-3.5 whitespace-nowrap text-xs text-slate-600">
-                    {formatDate(ticket.timeStemp)}
-                  </td>
-                  <td className="px-5 py-3.5 text-xs font-bold text-slate-800">
-                    {ticket.clientName}
-                  </td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600">
-                    {ticket.companyName}
-                  </td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600">
-                    {ticket.machineName || "-"}
-                  </td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600">
-                    {ticket.mentionIssue || "-"}
-                  </td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600">
-                    {ticket.serviceLocation}
-                  </td>
-                  <td className="px-5 py-3.5 text-xs">
-                    <span className={`px-2.5 py-0.5 rounded-full font-semibold border text-[11px] ${
-                      ticket.repairStatus === "Yes"
-                        ? "bg-emerald-50 text-emerald-700 border-emerald-100"
-                        : "bg-rose-50 text-rose-700 border-rose-100"
-                    }`}>
-                      {ticket.repairStatus}
-                    </span>
-                  </td>
-                  <td className="px-5 py-3.5 text-xs font-medium text-slate-700">
-                    {ticket.engineerName || "-"}
-                  </td>
-                  <td className="px-5 py-3.5 text-xs text-slate-500 max-w-[180px] truncate" title={ticket.remarks}>
-                    {ticket.remarks || "-"}
-                  </td>
-                </tr>
-              );
-            }
-          }}
+              <dl className="grid grid-cols-2 gap-x-3 gap-y-2 border-t pt-2">
+                <div><dt className="text-muted-foreground">Client</dt><dd className="font-semibold">{ticket.clientName || 'N/A'}</dd></div>
+                <div><dt className="text-muted-foreground">Company</dt><dd className="font-semibold">{ticket.companyName || 'N/A'}</dd></div>
+                <div><dt className="text-muted-foreground">Machine</dt><dd>{ticket.machineName || 'N/A'}</dd></div>
+                <div><dt className="text-muted-foreground">Location</dt><dd>{ticket.serviceLocation || 'N/A'}</dd></div>
+                <div className="col-span-2"><dt className="text-muted-foreground">Issue</dt><dd>{ticket.mentionIssue || 'N/A'}</dd></div>
+                {!isPending && <div><dt className="text-muted-foreground">Engineer</dt><dd className="font-semibold">{ticket.engineerName || 'N/A'}</dd></div>}
+                {ticket.remarks && <div className="col-span-2 rounded bg-secondary p-2"><dt className="text-muted-foreground">Remarks</dt><dd className="italic">{ticket.remarks}</dd></div>}
+              </dl>
+            </div>
+          )}
         />
       </div>
 
@@ -470,7 +241,7 @@ export default function RepairStatus() {
           isOpen={!!selectedTicket}
           onClose={() => setSelectedTicket(null)}
           ticket={selectedTicket}
-          onSave={loadTickets}
+          onSave={list.reload}
           engineerList={engineerList}
         />
       )}

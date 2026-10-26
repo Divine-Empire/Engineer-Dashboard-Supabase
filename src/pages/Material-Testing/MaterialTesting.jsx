@@ -1,16 +1,12 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
-import {
-  Search,
-  FileText,
-  RefreshCw,
-  Eye,
-  ClipboardCheck
-} from 'lucide-react';
-import TableWrapper from '../../components/TableWrapper';
+import { FileText, RefreshCw, Eye, ClipboardCheck } from 'lucide-react';
 import ModalWrapper from '../../components/ModalWrapper';
+import { StatusTabs, FilterSearch, FilterChips, DataTable, StatusBadge } from '../../components/shared';
 import formatDate from '../../utils/formatDate';
 import toast from 'react-hot-toast';
+import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-query';
 import { pfmsSupabase } from '../../lib/supabase/pfmsClient';
+import { useDebounced, PAGE_SIZES } from '../../hooks/use-stage-list';
 
 // Storage: pfms-purchase-fms bucket lives in the PFMS production project
 // (zpkikvgmmbtekbcuqahf), not the LTO project. Uploads use one-time signed
@@ -99,322 +95,252 @@ function SearchableSrnDropdown({ value, onChange, options, placeholder }) {
   );
 }
 
+// Pending / History are served page-by-page by /api/material-testing?action=list
+// (the PFMS tables are RLS-locked, so a service-role proxy is the only way in). Search,
+// the Pending/Completed split (cancelled indents excluded from Pending) and paging run
+// there; the browser only ever holds one page.
+//
+// Row shape reminders (verified against the PFMS production project):
+//   - pfms_material-testing is ONE row per lift, created upstream by Purchase-FMS-Supabase
+//     only when the lift's qcRequirement = 'yes'. Every QC submission UPDATEs that row in
+//     place (pendingQty/approvedQty/rejectedQty accumulate), so this page never inserts.
+//   - The row's own pendingQty > 0 is Pending, 0 is Completed.
+//   - Damage qty/reason/image and receivedQty come from pfms_material-received via the lift.
 export default function MaterialTesting() {
-  const [activeTab, setActiveTab] = useState('pending');
-  const [sheetRecords, setSheetRecords] = useState([]);
-  const [fetchLoading, setFetchLoading] = useState(false);
-  const [searchTerm, setSearchTerm] = useState('');
+  const queryClient = useQueryClient();
+  const [tab, setTabState] = useState('pending');
+  const [search, setSearchState] = useState('');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSizeState] = useState(20);
   const [selectedSale, setSelectedSale] = useState(null);
-  const [qcEngineerList, setQcEngineerList] = useState([]);
-  const [checklistList, setChecklistList] = useState([]);
-  const [rejectTypeList, setRejectTypeList] = useState([]);
-  const [historyDialogOpen, setHistoryDialogOpen] = useState(false);
   const [selectedHistoryRecord, setSelectedHistoryRecord] = useState(null);
+  const debouncedSearch = useDebounced(search, 350);
 
-  // Real schema (verified live against the PFMS production project,
-  // 2026-09-04 — see [[material-testing-migration]] memory):
-  //   - pfms_dropdown was migrated 2026-09-10 from a WIDE table (named
-  //     columns) to a NORMALIZED (id, category, value) table — see
-  //     Purchase-FMS-Supabase/sql-queries/2026-09-10_item-master-rename_
-  //     dropdown-restructure_purchaser-backfill.sql and its own
-  //     app/api/dropdowns/route.ts. The old "Checked By" column/category was
-  //     NOT migrated — QC engineer names now live under category 'Engineers'
-  //     instead. "QC-Checklist" and "Reject Type (QC)" migrated as-is, just
-  //     as category values instead of columns.
-  //   - pfms_material-testing is ONE row per lift, NOT a log. It's created
-  //     upstream by Purchase-FMS-Supabase's own material-received stage,
-  //     ONLY when that lift's qcRequirement = 'yes' (app/api/material-received
-  //     /route.ts) — most received lifts never get a row here at all. Every
-  //     QC submission UPDATEs that same row in place (pendingQty/approvedQty
-  //     /rejectedQty accumulate, checklist/serialNumbers/images arrays
-  //     append) — see app/api/material-testing/route.ts POST. This page must
-  //     mirror that: never insert a second row for a lift that already has
-  //     one, or Purchase-FMS-Supabase's own `.eq('liftNo',...).maybeSingle()`
-  //     fetch breaks.
-  //   - This row's OWN pendingQty/approvedQty/rejectedQty are the source of
-  //     truth for Pending vs History — NOT pfms_view-receiving_accounts'
-  //     planned_stage11 (that's set for every received lift, whether or not
-  //     QC is required, which is why querying it here previously showed ~500
-  //     "pending" instead of the ~32 lifts actually awaiting QC).
-  //   - checklist/serialNumbers/images are real Postgres arrays (text[]).
-  //   - Cancelled indents (pfms_order-cancellation) must be excluded from
-  //     Pending, same as the Purchase system's own route.
-  //   - Damage qty/reason/image and receivedQty live on pfms_material-received
-  //     (camelCase: damagedQty/damageReason/damageImage/receivedQty), joined
-  //     in via pfms_lift -> pfms_material-received.
-  //   - pfms_serial-number's columns are `liftNo`/`serialNo` (camelCase).
-  const loadSales = async () => {
-    setFetchLoading(true);
-    try {
-      // Goes through /api/material-testing (service_role, server-side): the PFMS
-      // tables have RLS with no anon policy, so a direct anon-key query here
-      // silently returns zero rows. See api/material-testing.js.
-      const { dropdowns: dropRows, testings, cancelledNos: cancelledList } =
-        await apiRequest('/api/material-testing');
+  const setTab = (t) => { setTabState(t); setPage(1); };
+  const setSearch = (v) => { setSearchState(v); setPage(1); };
+  const setPageSize = (n) => { setPageSizeState(n); setPage(1); };
 
-      const byCategory = (cat) =>
-        [...new Set(dropRows.filter((r) => r.category === cat).map((r) => r.value).filter(Boolean))];
-      setQcEngineerList(byCategory('Engineers'));
-      setChecklistList(byCategory('QC-Checklist'));
-      setRejectTypeList(byCategory('Reject Type (QC)'));
+  const listQ = useQuery({
+    queryKey: ['mt', 'list', tab, page, pageSize, debouncedSearch],
+    queryFn: () => apiRequest(`/api/material-testing?${new URLSearchParams({ action: 'list', tab, page, pageSize, search: debouncedSearch })}`),
+    placeholderData: keepPreviousData,
+  });
+  // Dropdown lists are only needed once a QC form opens.
+  const dropdownsQ = useQuery({
+    queryKey: ['mt', 'dropdowns'],
+    queryFn: () => apiRequest('/api/material-testing?action=dropdowns'),
+    enabled: !!selectedSale,
+    staleTime: 5 * 60_000,
+  });
 
-      const cancelledNos = new Set(cancelledList || []);
-
-      const rows = (testings || []).map((testing) => {
-        const lift = testing.lift || {};
-        const indent = lift.indent || {};
-        const negotiation = Array.isArray(indent.negotiation) ? (indent.negotiation[0] || {}) : (indent.negotiation || {});
-        const poEntry = Array.isArray(indent.poEntry) ? (indent.poEntry[0] || {}) : (indent.poEntry || {});
-        const matRecd = Array.isArray(lift.materialReceived) ? (lift.materialReceived[0] || {}) : (lift.materialReceived || {});
-
-        const receivedQty = parseFloat(matRecd.receivedQty || 0);
-        const pendingQty = testing.pendingQty !== null && testing.pendingQty !== undefined
-          ? testing.pendingQty
-          : receivedQty;
-
-        const checklistArr = Array.isArray(testing.checklist) ? testing.checklist : [];
-        const serialArr = Array.isArray(testing.serialNumbers) ? testing.serialNumbers : [];
-        const imageArr = Array.isArray(testing.images) ? testing.images : [];
-
-        return {
-          id: testing.id,
-          liftNo: lift.liftNo || '',
-          indentNumber: indent.indentNo || '',
-          status: pendingQty > 0 ? 'pending' : 'completed',
-          data: {
-            indentNumber: indent.indentNo || '',
-            liftNo: lift.liftNo || '',
-            vendorName: negotiation.selectedVendorName || '-',
-            poNumber: poEntry.poNumber || '-',
-            itemName: indent.itemName || '-',
-            invoiceNumber: matRecd.invoiceNumber || '-',
-            receivedQty,
-            plan7: matRecd.plannedMaterialTesting || '',
-            qcDate: testing.qcDate || testing.timestamp || '',
-            qcBy: testing.qcBy || '-',
-            approvedQty: testing.approvedQty || 0,
-            rejectedQty: testing.rejectedQty || 0,
-            totalApproved: testing.approvedQty || 0,
-            totalRejected: testing.rejectedQty || 0,
-            pendingQty,
-            damageQty: matRecd.damagedQty || '0',
-            damageReason: matRecd.damageReason || '-',
-            damageImage: matRecd.damageImage || '',
-            workingCondition: testing.workingCondition || '-',
-            checklist: checklistArr.length > 0 ? checklistArr.join(', ') : '-',
-            serialNo: serialArr.length > 0 ? serialArr.join(', ') : '-',
-            image: imageArr.length > 0 ? imageArr.join(' , ') : '-',
-            rejectType: testing.rejectType || '-',
-            partName: testing.partName || '-',
-            remarks: testing.remarks || '-',
-          },
-        };
-      });
-
-      // Exclude cancelled indents from Pending, same as the Purchase system.
-      const filteredRows = rows.filter((row) => row.status !== 'pending' || !cancelledNos.has(row.indentNumber));
-
-      setSheetRecords(filteredRows);
-    } catch (error) {
-      console.error('Error loading Material Testing data:', error);
-      toast.error('Failed to load live data');
-    } finally {
-      setFetchLoading(false);
-    }
-  };
-
+  const rows = listQ.data?.rows ?? [];
+  const total = listQ.data?.total ?? 0;
+  const counts = listQ.data?.counts;
+  const totalPages = Math.max(Math.ceil(total / pageSize), 1);
   useEffect(() => {
-    loadSales();
-    const handleRefresh = () => loadSales();
-    window.addEventListener('refresh_sales', handleRefresh);
-    return () => window.removeEventListener('refresh_sales', handleRefresh);
-  }, []);
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
 
-  const pending = useMemo(() => {
-    const searchLower = searchTerm.toLowerCase();
-    return sheetRecords.filter((r) => {
-      if (r.status !== 'pending') return false;
-      if (!searchLower) return true;
-      return (
-        r.data.indentNumber?.toLowerCase().includes(searchLower) ||
-        r.data.liftNo?.toLowerCase().includes(searchLower) ||
-        r.data.itemName?.toLowerCase().includes(searchLower) ||
-        r.data.vendorName?.toLowerCase().includes(searchLower) ||
-        String(r.data.poNumber || '').toLowerCase().includes(searchLower) ||
-        String(r.data.invoiceNumber || '').toLowerCase().includes(searchLower)
-      );
-    });
-  }, [sheetRecords, searchTerm]);
+  const reload = useCallback(() => queryClient.invalidateQueries({ queryKey: ['mt'] }), [queryClient]);
+  useEffect(() => {
+    window.addEventListener('refresh_sales', reload);
+    return () => window.removeEventListener('refresh_sales', reload);
+  }, [reload]);
 
-  const history = useMemo(() => {
-    const searchLower = searchTerm.toLowerCase();
-    return sheetRecords
-      .filter((r) => r.status === 'completed')
-      .filter((r) => {
-        if (!searchLower) return true;
-        return (
-          r.data.indentNumber?.toLowerCase().includes(searchLower) ||
-          r.data.liftNo?.toLowerCase().includes(searchLower) ||
-          r.data.vendorName?.toLowerCase().includes(searchLower) ||
-          r.data.itemName?.toLowerCase().includes(searchLower)
-        );
-      })
-      .reverse();
-  }, [sheetRecords, searchTerm]);
+  const tabs = [
+    { id: 'pending', label: 'Pending', count: counts?.pending },
+    { id: 'history', label: 'History', count: counts?.completed },
+  ];
+  const isPending = tab === 'pending';
+  const chips = debouncedSearch ? [{ key: 'search', label: `Search: ${debouncedSearch}`, onRemove: () => setSearch('') }] : [];
 
-  const activeRecords = activeTab === 'pending' ? pending : history;
+  const headers = isPending
+    ? [{ label: 'Action', className: 'w-28' }, 'Indent No.', 'Unit Tracking No.', 'Planned', 'Item', 'Received Qty', 'Approved', 'Rejected', 'Pending Qty', 'Damage Qty', 'Reason', 'Image']
+    : ['Indent No.', 'Lift No.', 'QC-Date', 'Working Condition', 'Checked By', 'Approved Qty', 'Checklist', 'Serial-No', 'Image', 'Reject Type', 'Part-Name', 'Reject Qty', 'Remarks'];
+  const hasValue = (v) => v && v !== '-';
+  const detailsBtn = (record, label) => (
+    <button
+      type="button"
+      onClick={() => setSelectedHistoryRecord(record)}
+      aria-label={`${label} for indent ${record.data.indentNumber}`}
+      className="rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+    >
+      <Eye size={15} aria-hidden="true" />
+    </button>
+  );
 
   return (
-    <div className="space-y-5 flex-1 flex flex-col min-h-0 overflow-hidden pr-1">
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 bg-white border border-slate-200 p-4 rounded-xl shadow-sm">
-        <div className="flex border border-slate-250 bg-slate-50/50 p-1 rounded-xl gap-1">
-          <button
-            onClick={() => setActiveTab('pending')}
-            className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all ${activeTab === 'pending' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'}`}
-          >
-            Pending ({pending.length})
-          </button>
-          <button
-            onClick={() => setActiveTab('history')}
-            className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all ${activeTab === 'history' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'}`}
-          >
-            History ({history.length})
-          </button>
-        </div>
-        <div className="flex items-stretch sm:items-center gap-3">
-          <div className="relative w-full sm:w-60">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-400" />
-            <input type="text" placeholder="Search records..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} className="block w-full pl-10 pr-3 py-1.5 text-xs bg-slate-50/50 border border-slate-200 rounded-lg text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:bg-white transition-all" />
-          </div>
-          <button onClick={loadSales} disabled={fetchLoading} className="p-1.5 border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed text-slate-600 transition-colors">
-            <RefreshCw className={`h-4 w-4 ${fetchLoading ? 'animate-spin' : ''}`} />
-          </button>
-        </div>
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <StatusTabs tabs={tabs} activeTab={tab} onChange={setTab} label="Material testing views" />
+        <FilterSearch value={search} onChange={setSearch} placeholder="Search indent, lift, item, vendor, PO, invoice..." className="min-w-[220px] flex-1" />
+        <button
+          type="button"
+          onClick={reload}
+          disabled={listQ.isFetching}
+          aria-label="Refresh"
+          className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-input bg-card text-sm text-foreground transition-colors hover:bg-accent disabled:opacity-50"
+        >
+          <RefreshCw className={`h-4 w-4 ${listQ.isFetching ? 'animate-spin' : ''}`} aria-hidden="true" />
+        </button>
       </div>
+      <FilterChips chips={chips} onClearAll={() => setSearch('')} />
 
-      <div className="flex-1 min-h-0 flex flex-col justify-between gap-4">
-        <TableWrapper
-          headers={activeTab === 'pending' ? ['Action', 'Indent No.', 'Unit Tracking No.', 'Planned', 'Item', 'Received Qty', 'Approved', 'Rejected', 'Pending Qty', 'Damage Qty', 'Reason', 'Image'] : ['Indent No.', 'Lift No.', 'QC-Date', 'Working Condition', 'Checked By', 'Approved Qty', 'Checklist', 'Serial-No', 'Image', 'Reject Type', 'Part-Name', 'Reject Qty', 'Remarks']}
-          data={activeRecords}
-          emptyMessage={fetchLoading ? (
-            <div className="flex items-center justify-center flex-col py-6">
-              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500"></div>
-              <p className="mt-2 text-xs text-slate-500 font-medium">Loading records...</p>
-            </div>
-          ) : 'No entries found.'}
-          renderCard={(record) => {
-            if (activeTab === 'pending') {
-              return (
-                <div key={record.id} className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 space-y-3 relative border-l-4 border-l-blue-500">
-                  <div className="absolute top-4 right-4">
-                    <button onClick={() => setSelectedSale(record)} className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm">Perform QC</button>
-                  </div>
-                  <div className="pr-24">
-                    <h3 className="font-bold text-slate-800 text-sm">Indent: {record.data.indentNumber}</h3>
-                    <p className="text-xs text-slate-500 mt-0.5">Lift No: {record.data.liftNo || 'N/A'}</p>
-                  </div>
-                  <div className="pt-2 border-t border-slate-100 space-y-2">
-                    <div className="text-xs"><p className="text-slate-500 font-medium">Item Name</p><p className="text-slate-800 font-semibold">{record.data.itemName}</p></div>
-                    <div className="grid grid-cols-2 gap-3 text-xs pt-1">
-                      <div><p className="text-slate-500 font-medium">Planned Date</p><p className="text-slate-800">{formatDate(record.data.plan7) || 'N/A'}</p></div>
-                      <div><p className="text-slate-500 font-medium">Received Qty</p><p className="text-slate-800 font-semibold">{record.data.receivedQty}</p></div>
-                    </div>
-                  </div>
+      <div className="min-h-0 flex-1">
+        <DataTable
+          ariaLabel={isPending ? 'Pending material testing' : 'Material testing history'}
+          headers={headers}
+          data={rows}
+          loading={listQ.isPending}
+          error={listQ.error ? listQ.error.message || 'Failed to load' : null}
+          onRetry={reload}
+          emptyTitle={chips.length ? 'No records match this search' : isPending ? 'No pending QC inspections' : 'No QC history yet'}
+          currentPage={page}
+          totalPages={totalPages}
+          itemsPerPage={pageSize}
+          totalResults={total}
+          onPageChange={setPage}
+          onItemsPerPageChange={setPageSize}
+          itemsPerPageOptions={PAGE_SIZES}
+          minWidth={isPending ? 'min-w-[1100px]' : 'min-w-[1200px]'}
+          renderCard={(record) => (
+            <div key={record.id} className="space-y-2 rounded-lg border bg-card p-3 text-xs shadow-sm">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <p className="text-sm font-semibold text-foreground">Indent: {record.data.indentNumber}</p>
+                  <p className="text-muted-foreground">Lift No: {record.data.liftNo || 'N/A'}</p>
                 </div>
-              );
-            }
-            return (
-              <div key={record.id} className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 space-y-3 relative border-l-4 border-l-emerald-500">
-                <div className="pr-4"><h3 className="font-bold text-slate-800 text-sm">Indent: {record.data.indentNumber}</h3><p className="text-xs text-slate-500 mt-0.5">Lift No: {record.data.liftNo || 'N/A'}</p></div>
-                <div className="pt-2 border-t border-slate-100 grid grid-cols-2 gap-2 text-xs">
-                  <div><p className="text-slate-500 font-medium">QC Date</p><p className="text-slate-800">{formatDate(record.data.qcDate) || 'N/A'}</p></div>
-                  <div><p className="text-slate-500 font-medium">Condition</p><span className="inline-block px-2 py-0.5 rounded-full font-semibold border text-xs bg-slate-50 text-slate-700 border-slate-200">{record.data.workingCondition}</span></div>
-                </div>
+                {isPending ? (
+                  <button type="button" onClick={() => setSelectedSale(record)} className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 font-semibold text-primary-foreground">
+                    <ClipboardCheck size={13} aria-hidden="true" />
+                    Perform QC
+                  </button>
+                ) : (
+                  <StatusBadge tone={record.data.workingCondition === 'Rejected' ? 'danger' : 'success'}>{record.data.workingCondition}</StatusBadge>
+                )}
               </div>
-            );
-          }}
-          renderRow={(record) => {
-            if (activeTab === 'pending') {
-              return (
-                <tr key={record.id} className="hover:bg-indigo-50/30 transition-colors">
-                  <td className="px-5 py-3.5"><button onClick={() => setSelectedSale(record)} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm">Perform QC</button></td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600 whitespace-nowrap">{record.data.indentNumber}</td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600 whitespace-nowrap">{record.data.liftNo}</td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600 whitespace-nowrap">{formatDate(record.data.plan7)}</td>
-                  <td className="px-5 py-3.5 text-xs font-bold text-slate-700 min-w-[500px]">{record.data.itemName}</td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600 font-semibold">{record.data.receivedQty}</td>
-                  <td className="px-5 py-3.5 text-xs text-emerald-600 font-bold">{record.data.totalApproved}</td>
-                  <td className="px-5 py-3.5 text-xs text-rose-600 font-bold">{record.data.totalRejected}</td>
-                  <td className="px-5 py-3.5 text-xs font-bold text-slate-800">{record.data.pendingQty}</td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600">{record.data.damageQty}</td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600">{record.data.damageReason}</td>
-                  <td className="px-5 py-3.5 text-xs text-slate-600">{record.data.damageImage && record.data.damageImage !== '-' && record.data.damageImage !== '' ? (<a href={record.data.damageImage} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-1"><FileText size={12} /> View</a>) : '-'}</td>
-                </tr>
-              );
-            }
-            return (
-              <tr key={record.id} className="hover:bg-indigo-50/30 transition-colors">
-                <td className="px-5 py-3.5 text-xs text-slate-600 whitespace-nowrap">{record.data.indentNumber}</td>
-                <td className="px-5 py-3.5 text-xs text-slate-600 whitespace-nowrap">{record.data.liftNo}</td>
-                <td className="px-5 py-3.5 text-xs text-slate-600 whitespace-nowrap">{formatDate(record.data.qcDate)}</td>
-                <td className="px-5 py-3.5 text-xs"><span className="px-2 py-0.5 rounded-full font-semibold border bg-slate-50 text-slate-700 border-slate-200">{record.data.workingCondition}</span></td>
-                <td className="px-5 py-3.5 text-xs text-slate-600">{record.data.qcBy}</td>
-                <td className="px-5 py-3.5 text-xs font-semibold text-slate-700">{record.data.approvedQty}</td>
-                <td className="px-5 py-3.5 text-center">{record.data.checklist && record.data.checklist !== '-' ? (<button onClick={() => { setSelectedHistoryRecord(record); setHistoryDialogOpen(true); }} className="text-slate-500 hover:text-blue-600 p-1 rounded hover:bg-slate-100"><Eye size={15} /></button>) : '-'}</td>
-                <td className="px-5 py-3.5 text-center">{record.data.serialNo && record.data.serialNo !== '-' ? (<button onClick={() => { setSelectedHistoryRecord(record); setHistoryDialogOpen(true); }} className="text-slate-500 hover:text-blue-600 p-1 rounded hover:bg-slate-100"><Eye size={15} /></button>) : '-'}</td>
-                <td className="px-5 py-3.5 text-center">{record.data.image && record.data.image !== '-' ? (<button onClick={() => { setSelectedHistoryRecord(record); setHistoryDialogOpen(true); }} className="text-slate-500 hover:text-blue-600 p-1 rounded hover:bg-slate-100"><Eye size={15} /></button>) : '-'}</td>
-                <td className="px-5 py-3.5 text-xs text-slate-600">{record.data.rejectType || '-'}</td>
-                <td className="px-5 py-3.5 text-xs text-slate-600">{record.data.partName || '-'}</td>
-                <td className="px-5 py-3.5 text-xs font-semibold text-rose-600">{record.data.rejectedQty || '0'}</td>
-                <td className="px-5 py-3.5 text-xs text-slate-500 max-w-[150px] truncate" title={record.data.remarks}>{record.data.remarks || '-'}</td>
-              </tr>
-            );
-          }}
+              <dl className="grid grid-cols-2 gap-x-3 gap-y-2 border-t pt-2">
+                {isPending ? (
+                  <>
+                    <div className="col-span-2"><dt className="text-muted-foreground">Item</dt><dd className="font-semibold">{record.data.itemName}</dd></div>
+                    <div><dt className="text-muted-foreground">Planned Date</dt><dd className="font-medium">{formatDate(record.data.plan7) || 'N/A'}</dd></div>
+                    <div><dt className="text-muted-foreground">Received Qty</dt><dd className="font-semibold">{record.data.receivedQty}</dd></div>
+                    <div><dt className="text-muted-foreground">Pending Qty</dt><dd className="font-semibold">{record.data.pendingQty}</dd></div>
+                  </>
+                ) : (
+                  <>
+                    <div><dt className="text-muted-foreground">QC Date</dt><dd className="font-medium">{formatDate(record.data.qcDate) || 'N/A'}</dd></div>
+                    <div><dt className="text-muted-foreground">Checked By</dt><dd className="font-medium">{record.data.qcBy}</dd></div>
+                    <div><dt className="text-muted-foreground">Approved Qty</dt><dd className="font-semibold">{record.data.approvedQty}</dd></div>
+                    <div><dt className="text-muted-foreground">Reject Qty</dt><dd className="font-semibold">{record.data.rejectedQty || '0'}</dd></div>
+                  </>
+                )}
+              </dl>
+              {!isPending && (hasValue(record.data.checklist) || hasValue(record.data.serialNo)) && (
+                <button type="button" onClick={() => setSelectedHistoryRecord(record)} className="text-xs font-semibold text-primary underline">View inspection details</button>
+              )}
+            </div>
+          )}
+          renderRow={(record) => (isPending ? (
+            <tr key={record.id}>
+              <td className="px-3.5 py-2 align-middle">
+                <button
+                  type="button"
+                  onClick={() => setSelectedSale(record)}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
+                >
+                  <ClipboardCheck size={13} aria-hidden="true" />
+                  Perform QC
+                </button>
+              </td>
+              <td className="px-3.5 py-2 text-xs text-foreground whitespace-nowrap align-middle">{record.data.indentNumber}</td>
+              <td className="px-3.5 py-2 text-xs text-foreground whitespace-nowrap align-middle">{record.data.liftNo}</td>
+              <td className="px-3.5 py-2 text-xs text-foreground whitespace-nowrap align-middle">{formatDate(record.data.plan7)}</td>
+              <td className="px-3.5 py-2 text-xs font-semibold text-foreground align-middle"><div className="max-w-[360px] truncate" title={record.data.itemName}>{record.data.itemName}</div></td>
+              <td className="px-3.5 py-2 text-xs font-semibold text-foreground align-middle">{record.data.receivedQty}</td>
+              <td className="px-3.5 py-2 text-xs font-semibold text-success align-middle">{record.data.totalApproved}</td>
+              <td className="px-3.5 py-2 text-xs font-semibold text-destructive align-middle">{record.data.totalRejected}</td>
+              <td className="px-3.5 py-2 text-xs font-semibold text-foreground align-middle">{record.data.pendingQty}</td>
+              <td className="px-3.5 py-2 text-xs text-foreground align-middle">{record.data.damageQty}</td>
+              <td className="px-3.5 py-2 text-xs text-foreground align-middle">{record.data.damageReason}</td>
+              <td className="px-3.5 py-2 text-xs align-middle">
+                {hasValue(record.data.damageImage) ? (
+                  <a href={record.data.damageImage} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 font-semibold text-primary underline">
+                    <FileText size={12} aria-hidden="true" /> View
+                  </a>
+                ) : '-'}
+              </td>
+            </tr>
+          ) : (
+            <tr key={record.id}>
+              <td className="px-3.5 py-2 text-xs text-foreground whitespace-nowrap align-middle">{record.data.indentNumber}</td>
+              <td className="px-3.5 py-2 text-xs text-foreground whitespace-nowrap align-middle">{record.data.liftNo}</td>
+              <td className="px-3.5 py-2 text-xs text-foreground whitespace-nowrap align-middle">{formatDate(record.data.qcDate)}</td>
+              <td className="px-3.5 py-2 align-middle"><StatusBadge tone={record.data.workingCondition === 'Rejected' ? 'danger' : 'success'}>{record.data.workingCondition}</StatusBadge></td>
+              <td className="px-3.5 py-2 text-xs text-foreground align-middle">{record.data.qcBy}</td>
+              <td className="px-3.5 py-2 text-xs font-semibold text-foreground align-middle">{record.data.approvedQty}</td>
+              <td className="px-3.5 py-2 text-center align-middle">{hasValue(record.data.checklist) ? detailsBtn(record, 'View checklist') : '-'}</td>
+              <td className="px-3.5 py-2 text-center align-middle">{hasValue(record.data.serialNo) ? detailsBtn(record, 'View serial numbers') : '-'}</td>
+              <td className="px-3.5 py-2 text-center align-middle">{hasValue(record.data.image) ? detailsBtn(record, 'View photos') : '-'}</td>
+              <td className="px-3.5 py-2 text-xs text-foreground align-middle">{record.data.rejectType || '-'}</td>
+              <td className="px-3.5 py-2 text-xs text-foreground align-middle">{record.data.partName || '-'}</td>
+              <td className="px-3.5 py-2 text-xs font-semibold text-destructive align-middle">{record.data.rejectedQty || '0'}</td>
+              <td className="px-3.5 py-2 text-xs text-muted-foreground align-middle"><div className="max-w-[150px] truncate" title={record.data.remarks}>{record.data.remarks || '-'}</div></td>
+            </tr>
+          ))}
         />
       </div>
 
       {selectedSale && (
-        <QCFormModal isOpen={!!selectedSale} onClose={() => setSelectedSale(null)} record={selectedSale} onSave={loadSales} qcEngineerList={qcEngineerList} checklistList={checklistList} rejectTypeList={rejectTypeList} />
+        <QCFormModal
+          isOpen
+          onClose={() => setSelectedSale(null)}
+          record={selectedSale}
+          onSave={reload}
+          qcEngineerList={dropdownsQ.data?.engineers || []}
+          checklistList={dropdownsQ.data?.checklist || []}
+          rejectTypeList={dropdownsQ.data?.rejectTypes || []}
+        />
       )}
 
-      {historyDialogOpen && selectedHistoryRecord && (
-        <ModalWrapper isOpen={historyDialogOpen} onClose={() => setHistoryDialogOpen(false)} title="Inspection Details" maxWidth="max-w-md">
+      {selectedHistoryRecord && (
+        <ModalWrapper isOpen onClose={() => setSelectedHistoryRecord(null)} title="Inspection Details" maxWidth="max-w-md">
           <div className="space-y-5">
-            <div className="grid grid-cols-2 gap-4 bg-slate-50 p-4 rounded-xl border border-slate-100">
-              <div><span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Indent No</span><span className="text-xs font-bold text-slate-800">{selectedHistoryRecord.data.indentNumber}</span></div>
-              <div><span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Lift No</span><span className="text-xs font-bold text-slate-800">{selectedHistoryRecord.data.liftNo}</span></div>
-              <div><span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">QC Date</span><span className="text-xs font-medium text-slate-850">{formatDate(selectedHistoryRecord.data.qcDate)}</span></div>
-              <div><span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Checked By</span><span className="text-xs font-medium text-slate-850">{selectedHistoryRecord.data.qcBy}</span></div>
+            <div className="grid grid-cols-2 gap-4 rounded-xl border border-slate-100 bg-slate-50 p-4">
+              <div><span className="block text-[10px] font-bold uppercase tracking-wider text-slate-500">Indent No</span><span className="text-xs font-bold text-slate-800">{selectedHistoryRecord.data.indentNumber}</span></div>
+              <div><span className="block text-[10px] font-bold uppercase tracking-wider text-slate-500">Lift No</span><span className="text-xs font-bold text-slate-800">{selectedHistoryRecord.data.liftNo}</span></div>
+              <div><span className="block text-[10px] font-bold uppercase tracking-wider text-slate-500">QC Date</span><span className="text-xs font-medium text-slate-800">{formatDate(selectedHistoryRecord.data.qcDate)}</span></div>
+              <div><span className="block text-[10px] font-bold uppercase tracking-wider text-slate-500">Checked By</span><span className="text-xs font-medium text-slate-800">{selectedHistoryRecord.data.qcBy}</span></div>
             </div>
             <div className="space-y-2">
-              <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">QC Checklist</h4>
-              {selectedHistoryRecord.data.checklist && selectedHistoryRecord.data.checklist !== '-' ? (
-                <div className="flex flex-wrap gap-1.5">{selectedHistoryRecord.data.checklist.split(',').map((item, i) => (<span key={i} className="text-xs font-medium bg-emerald-50 text-emerald-700 border border-emerald-100 px-2.5 py-1 rounded-full">✓ {item.trim()}</span>))}</div>
-              ) : (<span className="text-xs text-slate-400 italic">No checklist recorded</span>)}
+              <h4 className="text-[10px] font-bold uppercase tracking-wider text-slate-500">QC Checklist</h4>
+              {hasValue(selectedHistoryRecord.data.checklist) ? (
+                <div className="flex flex-wrap gap-1.5">{selectedHistoryRecord.data.checklist.split(',').map((item, i) => (<span key={i} className="rounded-full border border-emerald-100 bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-800">✓ {item.trim()}</span>))}</div>
+              ) : (<span className="text-xs italic text-slate-500">No checklist recorded</span>)}
             </div>
             <div className="space-y-2">
-              <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Serial Numbers & Photos</h4>
-              <div className="space-y-2 max-h-[200px] overflow-y-auto pr-1">
-                {selectedHistoryRecord.data.serialNo && selectedHistoryRecord.data.serialNo !== '-' ? (
+              <h4 className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Serial Numbers & Photos</h4>
+              <div className="max-h-[200px] space-y-2 overflow-y-auto pr-1">
+                {hasValue(selectedHistoryRecord.data.serialNo) ? (
                   (() => {
                     const serials = String(selectedHistoryRecord.data.serialNo).split(',').map((s) => s.trim()).filter(Boolean);
-                    const images = selectedHistoryRecord?.data?.image && selectedHistoryRecord.data.image !== '-' ? String(selectedHistoryRecord.data.image).split(',').map((i) => i.trim()).filter(Boolean) : [];
+                    const images = hasValue(selectedHistoryRecord.data.image) ? String(selectedHistoryRecord.data.image).split(',').map((i) => i.trim()).filter(Boolean) : [];
                     return serials.map((serial, idx) => {
                       const imageUrl = images[idx] || '';
                       return (
-                        <div key={idx} className="flex items-center justify-between p-2.5 bg-slate-50 border border-slate-100 rounded-lg">
-                          <span className="text-xs font-semibold text-slate-400">#{idx + 1}</span>
-                          {imageUrl ? (<a href={imageUrl} target="_blank" rel="noopener noreferrer" className="text-xs font-semibold text-blue-600 hover:underline flex items-center gap-1.5 bg-white px-2.5 py-1 rounded border border-slate-200 shadow-sm transition-all hover:bg-slate-50"><FileText size={12} className="text-blue-500" />{serial}</a>) : (<span className="text-xs text-slate-600 font-medium bg-white px-2.5 py-1 rounded border border-slate-200">{serial}</span>)}
+                        <div key={idx} className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 p-2.5">
+                          <span className="text-xs font-semibold text-slate-500">#{idx + 1}</span>
+                          {imageUrl ? (<a href={imageUrl} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1.5 rounded border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-blue-700 shadow-sm transition-all hover:bg-slate-50 hover:underline"><FileText size={12} aria-hidden="true" />{serial}</a>) : (<span className="rounded border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700">{serial}</span>)}
                         </div>
                       );
                     });
                   })()
-                ) : (<span className="text-xs text-slate-400 italic">No serial numbers recorded</span>)}
+                ) : (<span className="text-xs italic text-slate-500">No serial numbers recorded</span>)}
               </div>
             </div>
           </div>
-          <div className="flex justify-end pt-4 border-t border-slate-100 mt-5">
-            <button onClick={() => setHistoryDialogOpen(false)} className="px-5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-xs font-bold transition-all">Close</button>
+          <div className="mt-5 flex justify-end border-t border-slate-100 pt-4">
+            <button type="button" onClick={() => setSelectedHistoryRecord(null)} className="rounded-xl bg-slate-100 px-5 py-2 text-xs font-bold text-slate-700 transition-all hover:bg-slate-200">Close</button>
           </div>
         </ModalWrapper>
       )}
@@ -535,33 +461,33 @@ function QCFormModal({ isOpen, onClose, record, onSave, qcEngineerList, checklis
   };
 
   const inputCls = 'block w-full text-xs bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white transition-all';
-  const labelCls = 'text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1 block';
+  const labelCls = 'text-[10px] font-bold text-slate-600 uppercase tracking-wider mb-1 block';
 
   return (
     <ModalWrapper isOpen={isOpen} onClose={onClose} title={`QC inspection: Indent ${record.data.indentNumber}`} maxWidth="max-w-2xl">
       <form onSubmit={handleSubmit} className="space-y-5">
         <div className="bg-slate-50 border border-slate-150 p-4 rounded-xl grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-          <div><span className="text-[10px] font-semibold text-slate-400 block">Item</span><span className="font-bold text-slate-700 truncate block">{record.data.itemName}</span></div>
-          <div><span className="text-[10px] font-semibold text-slate-400 block">Vendor</span><span className="font-bold text-slate-700 truncate block">{record.data.vendorName}</span></div>
-          <div><span className="text-[10px] font-semibold text-slate-400 block">Tracking No.</span><span className="font-semibold text-slate-600 truncate block">{record.data.liftNo}</span></div>
-          <div><span className="text-[10px] font-semibold text-slate-400 block">Pending Qty</span><span className="font-bold text-indigo-600">{record.data.pendingQty} of {record.data.receivedQty}</span></div>
+          <div><span className="text-[10px] font-semibold text-slate-600 block">Item</span><span className="font-bold text-slate-700 truncate block">{record.data.itemName}</span></div>
+          <div><span className="text-[10px] font-semibold text-slate-600 block">Vendor</span><span className="font-bold text-slate-700 truncate block">{record.data.vendorName}</span></div>
+          <div><span className="text-[10px] font-semibold text-slate-600 block">Tracking No.</span><span className="font-semibold text-slate-600 truncate block">{record.data.liftNo}</span></div>
+          <div><span className="text-[10px] font-semibold text-slate-600 block">Pending Qty</span><span className="font-bold text-indigo-600">{record.data.pendingQty} of {record.data.receivedQty}</span></div>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div>
-            <label className={labelCls}>QC-Date *</label>
-            <input type="date" value={qcDate} onChange={(e) => setQcDate(e.target.value)} required className={`${inputCls} cursor-pointer`} />
+            <label htmlFor="qc-date" className={labelCls}>QC-Date *</label>
+            <input id="qc-date" type="date" value={qcDate} onChange={(e) => setQcDate(e.target.value)} required className={`${inputCls} cursor-pointer`} />
           </div>
           <div>
-            <label className={labelCls}>Checked By *</label>
-            <select value={qcBy} onChange={(e) => setQcBy(e.target.value)} required={workingCondition !== 'Rejected'} className={inputCls}>
+            <label htmlFor="qc-by" className={labelCls}>Checked By *</label>
+            <select id="qc-by" value={qcBy} onChange={(e) => setQcBy(e.target.value)} required={workingCondition !== 'Rejected'} className={inputCls}>
               <option value="">Select Inspector</option>
               {qcEngineerList.map((name, idx) => (<option key={idx} value={name}>{name}</option>))}
             </select>
           </div>
           <div>
-            <label className={labelCls}>Working Condition *</label>
-            <select value={workingCondition} onChange={(e) => setWorkingCondition(e.target.value)} required className={inputCls}>
+            <label htmlFor="qc-condition" className={labelCls}>Working Condition *</label>
+            <select id="qc-condition" value={workingCondition} onChange={(e) => setWorkingCondition(e.target.value)} required className={inputCls}>
               <option value="">Select Condition</option>
               <option value="Passed">Passed</option>
               <option value="Passed but Quality Concern">Passed but Quality Concern</option>
@@ -574,8 +500,9 @@ function QCFormModal({ isOpen, onClose, record, onSave, qcEngineerList, checklis
           <div className="space-y-4">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
-                <label className={labelCls}>Approved Qty *</label>
+                <label htmlFor="qc-approved-qty" className={labelCls}>Approved Qty *</label>
                 <input
+                  id="qc-approved-qty"
                   type="number"
                   min="1"
                   max={record.data.pendingQty}
@@ -604,18 +531,18 @@ function QCFormModal({ isOpen, onClose, record, onSave, qcEngineerList, checklis
             </div>
             {srnEntries.length > 0 && (
               <div className="bg-slate-50 border border-slate-150 p-4 rounded-xl space-y-3">
-                <span className="text-xs font-bold text-slate-700">Approved Item Serial Numbers & Photos {serialsLoading && <span className="text-slate-400 font-normal">(loading serials...)</span>}</span>
+                <span className="text-xs font-bold text-slate-700">Approved Item Serial Numbers & Photos {serialsLoading && <span className="text-slate-600 font-normal">(loading serials...)</span>}</span>
                 <div className="space-y-3 max-h-[220px] overflow-y-auto pr-1">
                   {srnEntries.map((entry, idx) => (
                     <div key={entry.serialNo} className="grid grid-cols-12 gap-3 items-center bg-white p-2.5 rounded-xl border border-slate-100">
-                      <div className="col-span-1 text-xs font-bold text-slate-400">#{entry.serialNo}</div>
+                      <div className="col-span-1 text-xs font-bold text-slate-600">#{entry.serialNo}</div>
                       <div className="col-span-5 relative"><SearchableSrnDropdown value={entry.srn} onChange={(val) => { const u = [...srnEntries]; u[idx] = { ...u[idx], srn: val }; setSrnEntries(u); }} options={serialNoList} placeholder="Search/Select SRN" /></div>
                       <div className="col-span-6 flex items-center gap-2">
                         <div className="flex-1">
                           <input type="file" accept="image/*" id={`srn-image-${idx}`} className="hidden" onChange={(e) => { const f = e.target.files?.[0] || null; const u = [...srnEntries]; u[idx] = { ...u[idx], image: f }; setSrnEntries(u); }} />
                           <label htmlFor={`srn-image-${idx}`} className={`flex items-center justify-center gap-1.5 px-3 py-2 border rounded-xl cursor-pointer transition-all h-9 text-xs font-semibold ${entry.image ? 'bg-emerald-50 border-emerald-200 text-emerald-700 hover:bg-emerald-100' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}><FileText size={12} /><span className="truncate max-w-[120px]">{entry.image ? entry.image.name : 'Photo'}</span></label>
                         </div>
-                        {entry.image && (<button type="button" onClick={() => { const u = [...srnEntries]; u[idx] = { ...u[idx], image: null }; setSrnEntries(u); }} className="text-slate-400 hover:text-rose-500 font-bold p-1">✕</button>)}
+                        {entry.image && (<button type="button" onClick={() => { const u = [...srnEntries]; u[idx] = { ...u[idx], image: null }; setSrnEntries(u); }} className="text-slate-600 hover:text-rose-500 font-bold p-1">✕</button>)}
                       </div>
                     </div>
                   ))}
@@ -629,16 +556,17 @@ function QCFormModal({ isOpen, onClose, record, onSave, qcEngineerList, checklis
           <div className="space-y-4">
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div>
-                <label className={labelCls}>Reject Type *</label>
-                <select value={rejectType} onChange={(e) => setRejectType(e.target.value)} required className={inputCls}>
+                <label htmlFor="qc-reject-type" className={labelCls}>Reject Type *</label>
+                <select id="qc-reject-type" value={rejectType} onChange={(e) => setRejectType(e.target.value)} required className={inputCls}>
                   <option value="">Select type</option>
                   {rejectTypeList.map((r) => (<option key={r} value={r}>{r}</option>))}
                 </select>
               </div>
-              <div><label className={labelCls}>Part-Name *</label><input type="text" placeholder="Enter part name" value={partName} onChange={(e) => setPartName(e.target.value)} required className={inputCls} /></div>
+              <div><label htmlFor="qc-part-name" className={labelCls}>Part-Name *</label><input id="qc-part-name" type="text" placeholder="Enter part name" value={partName} onChange={(e) => setPartName(e.target.value)} required className={inputCls} /></div>
               <div>
-                <label className={labelCls}>Reject Qty *</label>
+                <label htmlFor="qc-reject-qty" className={labelCls}>Reject Qty *</label>
                 <input
+                  id="qc-reject-qty"
                   type="number"
                   min="1"
                   max={record.data.pendingQty}
@@ -660,14 +588,14 @@ function QCFormModal({ isOpen, onClose, record, onSave, qcEngineerList, checklis
                 <div className="space-y-3 max-h-[220px] overflow-y-auto pr-1">
                   {rejectSrnEntries.map((entry, idx) => (
                     <div key={entry.serialNo} className="grid grid-cols-12 gap-3 items-center bg-white p-2.5 rounded-xl border border-slate-100">
-                      <div className="col-span-1 text-xs font-bold text-slate-400">#{entry.serialNo}</div>
+                      <div className="col-span-1 text-xs font-bold text-slate-600">#{entry.serialNo}</div>
                       <div className="col-span-5 relative"><SearchableSrnDropdown value={entry.srn} onChange={(val) => { const u = [...rejectSrnEntries]; u[idx] = { ...u[idx], srn: val }; setRejectSrnEntries(u); }} options={serialNoList} placeholder="Search/Select SRN" /></div>
                       <div className="col-span-6 flex items-center gap-2">
                         <div className="flex-1">
                           <input type="file" accept="image/*" id={`reject-srn-image-${idx}`} className="hidden" onChange={(e) => { const f = e.target.files?.[0] || null; const u = [...rejectSrnEntries]; u[idx] = { ...u[idx], image: f }; setRejectSrnEntries(u); }} />
                           <label htmlFor={`reject-srn-image-${idx}`} className={`flex items-center justify-center gap-1.5 px-3 py-2 border rounded-xl cursor-pointer transition-all h-9 text-xs font-semibold ${entry.image ? 'bg-emerald-50 border-emerald-200 text-emerald-700 hover:bg-emerald-100' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}><FileText size={12} /><span className="truncate max-w-[120px]">{entry.image ? entry.image.name : 'Photo'}</span></label>
                         </div>
-                        {entry.image && (<button type="button" onClick={() => { const u = [...rejectSrnEntries]; u[idx] = { ...u[idx], image: null }; setRejectSrnEntries(u); }} className="text-slate-400 hover:text-rose-500 font-bold p-1">✕</button>)}
+                        {entry.image && (<button type="button" onClick={() => { const u = [...rejectSrnEntries]; u[idx] = { ...u[idx], image: null }; setRejectSrnEntries(u); }} className="text-slate-600 hover:text-rose-500 font-bold p-1">✕</button>)}
                       </div>
                     </div>
                   ))}
@@ -678,8 +606,8 @@ function QCFormModal({ isOpen, onClose, record, onSave, qcEngineerList, checklis
         )}
 
         <div>
-          <label className={labelCls}>{workingCondition === 'Passed but Quality Concern' ? 'Concern Issue' : 'Remarks'}</label>
-          <textarea value={remarks} onChange={(e) => setRemarks(e.target.value)} placeholder={workingCondition === 'Passed but Quality Concern' ? 'Explain concern details...' : 'Enter remarks...'} rows={3} className={`${inputCls} resize-none`} />
+          <label htmlFor="qc-remarks" className={labelCls}>{workingCondition === 'Passed but Quality Concern' ? 'Concern Issue' : 'Remarks'}</label>
+          <textarea id="qc-remarks" value={remarks} onChange={(e) => setRemarks(e.target.value)} placeholder={workingCondition === 'Passed but Quality Concern' ? 'Explain concern details...' : 'Enter remarks...'} rows={3} className={`${inputCls} resize-none`} />
         </div>
 
         <div className="flex justify-end gap-3 pt-2">

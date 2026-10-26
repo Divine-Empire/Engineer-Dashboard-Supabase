@@ -1,20 +1,18 @@
-import React, { useState } from 'react';
+import React, { lazy } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import Layout from './layout';
 import Login from '../pages/auth/Login';
-import Dashboard from '../pages/dashboard/Dashboard';
-import VideoCall from '../pages/Video-Call/Video-Call';
-import MaterialTesting from '../pages/Material-Testing/MaterialTesting';
-import RepairStatus from '../pages/Repair-Status/repair-status';
-import ServiceInstallation from '../pages/service-installation/service-installation';
-import TADA from '../pages/TADA/TADA';
-import SiteVisitOTPVerification from '../pages/OTP-Verification/SiteVisitOTPVerification';
+
+// Each page is its own chunk, loaded on first visit (Layout wraps <Outlet /> in Suspense).
+const Dashboard = lazy(() => import('../pages/dashboard/Dashboard'));
+const VideoCall = lazy(() => import('../pages/Video-Call/Video-Call'));
+const MaterialTesting = lazy(() => import('../pages/Material-Testing/MaterialTesting'));
+const RepairStatus = lazy(() => import('../pages/Repair-Status/repair-status'));
+const ServiceInstallation = lazy(() => import('../pages/service-installation/service-installation'));
+const TADA = lazy(() => import('../pages/TADA/TADA'));
+const SiteVisitOTPVerification = lazy(() => import('../pages/OTP-Verification/SiteVisitOTPVerification'));
 
 export default function AppRoutes() {
-
-
-
-
   return (
     <>
       <Routes>

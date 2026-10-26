@@ -2,27 +2,37 @@ import js from '@eslint/js';
 import globals from 'globals';
 import reactHooks from 'eslint-plugin-react-hooks';
 import reactRefresh from 'eslint-plugin-react-refresh';
-import tseslint from 'typescript-eslint';
+import react from 'eslint-plugin-react';
 
-export default tseslint.config(
-  { ignores: ['dist'] },
+// `npm run lint`. Errors fail the build; the long-standing patterns below are
+// warnings so they stay visible without blocking (same policy as OTP_Supabase).
+export default [
+  { ignores: ['dist', 'node_modules'] },
+  js.configs.recommended,
   {
-    extends: [js.configs.recommended, ...tseslint.configs.recommended],
-    files: ['**/*.{ts,tsx}'],
+    files: ['src/**/*.{js,jsx}'],
     languageOptions: {
-      ecmaVersion: 2020,
+      ecmaVersion: 2022,
+      sourceType: 'module',
       globals: globals.browser,
+      parserOptions: { ecmaFeatures: { jsx: true } },
     },
-    plugins: {
-      'react-hooks': reactHooks,
-      'react-refresh': reactRefresh,
-    },
+    plugins: { 'react-hooks': reactHooks, 'react-refresh': reactRefresh, react },
     rules: {
       ...reactHooks.configs.recommended.rules,
-      'react-refresh/only-export-components': [
-        'warn',
-        { allowConstantExport: true },
-      ],
+      // Core no-undef / no-unused-vars cannot see JSX usage; these two close that gap
+      // (an unimported <Icon /> otherwise only fails at runtime).
+      'react/jsx-no-undef': 'error',
+      'react/jsx-uses-vars': 'error',
+      'react-hooks/exhaustive-deps': 'warn',
+      'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],
+      // `_`-prefixed names are intentional.
+      'no-unused-vars': ['warn', { varsIgnorePattern: '^_|^React$', argsIgnorePattern: '^_', ignoreRestSiblings: true }],
     },
-  }
-);
+  },
+  {
+    files: ['api/**/*.js', 'vite.config.js', 'tailwind.config.js', 'postcss.config.js'],
+    languageOptions: { ecmaVersion: 2022, sourceType: 'module', globals: globals.node },
+    rules: { 'no-unused-vars': ['warn', { argsIgnorePattern: '^_' }] },
+  },
+];

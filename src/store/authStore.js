@@ -4,7 +4,7 @@ const storedUser = localStorage.getItem('user');
 let parsedUser = null;
 try {
   parsedUser = storedUser ? JSON.parse(storedUser) : null;
-} catch (e) {
+} catch {
   parsedUser = null;
 }
 

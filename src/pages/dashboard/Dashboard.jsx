@@ -3,18 +3,17 @@ import {
   CheckCircle2,
   Phone,
   ClipboardCheck,
-  Search,
   Calendar,
   ClipboardList,
   Loader2Icon,
-  LoaderIcon,
   Plus,
-  RotateCcw,
-  Trash2,
 } from 'lucide-react';
 import MetricCard from '../../components/MetricCard';
-import TableWrapper from '../../components/TableWrapper';
-import formatDate from '../../utils/formatDate';
+import { DataTable, StatusBadge, FilterSearch } from '../../components/shared';
+import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-query';
+import { fetchViewPage, countView, scopeBy } from '../../lib/pagedView';
+import { fetchAllRows } from '../../utils/fetchAllRows';
+import { useDebounced } from '../../hooks/use-stage-list';
 import VisitCalendarModal from './VisitCalendarModal';
 import { useAuthStore } from '../../store/authStore';
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip } from "recharts";
@@ -43,43 +42,6 @@ import {
 import { Modal } from "../../components/ui/modal";
 import toast from 'react-hot-toast';
 import { Textarea } from "../../components/ui/textarea";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "../../components/ui/dialog";
-
-const PREMIUM_COLORS = [
-  { bg: "bg-emerald-50 text-emerald-700 border-emerald-200", badge: "bg-emerald-100 text-emerald-800" },
-  { bg: "bg-indigo-50 text-indigo-700 border-indigo-200", badge: "bg-indigo-100 text-indigo-800" },
-  { bg: "bg-amber-50 text-amber-700 border-amber-200", badge: "bg-amber-100 text-amber-800" },
-  { bg: "bg-rose-50 text-rose-700 border-rose-200", badge: "bg-rose-100 text-rose-800" },
-  { bg: "bg-sky-50 text-sky-700 border-sky-200", badge: "bg-sky-100 text-sky-800" },
-  { bg: "bg-violet-50 text-violet-700 border-violet-200", badge: "bg-violet-100 text-violet-800" },
-  { bg: "bg-fuchsia-50 text-fuchsia-700 border-fuchsia-200", badge: "bg-fuchsia-100 text-fuchsia-800" },
-  { bg: "bg-cyan-50 text-cyan-700 border-cyan-200", badge: "bg-cyan-100 text-cyan-800" },
-  { bg: "bg-teal-50 text-teal-700 border-teal-200", badge: "bg-teal-100 text-teal-800" },
-  { bg: "bg-orange-50 text-orange-700 border-orange-200", badge: "bg-orange-100 text-orange-800" },
-];
-
-const getEngineerColor = (name) => {
-  if (!name) return { bg: "bg-slate-50 text-slate-700 border-slate-200", badge: "bg-slate-100 text-slate-850" };
-  let hash = 0;
-  for (let i = 0; i < name.length; i++) {
-    hash = name.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  return PREMIUM_COLORS[Math.abs(hash) % PREMIUM_COLORS.length];
-};
-
-const getValueByColIndex = (row, colIndex) => {
-  if (!Array.isArray(row)) return "";
-  if (row.length > 0 && Array.isArray(row[0])) {
-    const cell = row.find(c => Array.isArray(c) && c[0] === colIndex);
-    return cell !== undefined && cell !== null ? cell[1] : "";
-  }
-  return row[colIndex] !== undefined && row[colIndex] !== null ? row[colIndex] : "";
-};
 
 const IST_FORMATTER = new Intl.DateTimeFormat("en-US", {
   timeZone: "Asia/Kolkata",
@@ -137,17 +99,6 @@ const parseIST = (dateStr) => {
   return null;
 };
 
-const formatMinutesToTime = (min) => {
-  const totalMin = min + 9 * 60;
-  let hrs = Math.floor(totalMin / 60);
-  const mins = totalMin % 60;
-  const ampm = hrs >= 12 ? "PM" : "AM";
-  hrs = hrs % 12;
-  if (hrs === 0) hrs = 12;
-  const minStr = String(mins).padStart(2, "0");
-  return `${hrs}:${minStr} ${ampm}`;
-};
-
 const formatCallTime = (timeStr) => {
   if (!timeStr) return "";
   const str = String(timeStr).trim();
@@ -190,289 +141,138 @@ const formatCallTime = (timeStr) => {
   return str;
 };
 
+// ── Data (all server-side: counts, the "latest" list and the calendar window come from SQL) ──
+// Video Call numbers use the same views as the Video Call page (Database/03), so a card always
+// equals that page's tab count. Engineers see their own tickets, admins everything.
+const VC_VIEWS = { pending: 'engg_v_video_call_pending', history: 'engg_v_video_call_history', all: 'engg_v_video_call_all' };
+
+const mapVcRow = (r) => ({
+  id: r.id,
+  timeStemp: r.ticket_created_at || '',
+  ticketId: r.ticket_id || '',
+  clientName: r.client_name || '',
+  companyName: r.company_name || '',
+  category: r.category || '',
+  phoneNumber: r.phone_number || '',
+  actual2: r.is_pending ? '' : String(r.attempt_created_at || '').trim(),
+});
+
+// Material Testing comes from the PFMS project through the server-side proxy, one small
+// page per call. Pending/Completed counts ride along on every response (same rule as the
+// Material Testing page: a lift's own pendingQty > 0 is Pending; cancelled indents excluded).
+async function fetchQc({ tab, search }) {
+  const qs = new URLSearchParams({ action: 'list', tab, page: 1, pageSize: 8, search, newestFirst: '1' });
+  const res = await fetch(`/api/material-testing?${qs}`);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+  return body;
+}
+
+const mapQcRow = (r) => ({
+  id: r.id,
+  indentNumber: String(r.data.indentNumber || '').trim(),
+  liftNo: String(r.data.liftNo || '').trim(),
+  itemName: String(r.data.itemName || '').trim(),
+  receivedQty: r.data.receivedQty || '0',
+  approvedQty: r.data.approvedQty || 0,
+  status: r.status,
+});
+
+async function loadEngineerNames() {
+  const { data, error } = await supabase.from('sss_dropdown').select('value').eq('category', 'engineer_assign_name');
+  if (error) throw error;
+  return [...new Set((data || []).map((r) => String(r.value || '').trim()).filter(Boolean))];
+}
+
+// Calendar events overlapping [start, end] (YYYY-MM-DD) from engg_v_calendar_events (Database/06).
+async function fetchCalendarEvents({ start, end }, scope) {
+  const { data, error } = await fetchAllRows(() => {
+    let q = supabase.from('engg_v_calendar_events').select('*').lte('start_on', end).gte('end_on', start).order('ev_id');
+    if (scope) q = scope(q);
+    return q;
+  });
+  if (error) throw error;
+  return (data || []).map((r, index) => ({
+    id: index + 1,
+    ticketId: r.ticket_id || '',
+    companyName: r.company_name || '',
+    clientName: r.client_name || '',
+    phoneNumber: r.phone_number || '',
+    mentionIssue: r.mention_issue || '',
+    engineerAssign: r.engineer_assign || '',
+    dateOfVisit: r.date_of_visit || '',
+    travelDate: r.travel_date || '',
+    returnDate: r.return_date || '',
+    expectedCompletionDate: r.expected_completion_date || '',
+    expectedCompletionTime: r.type === 'Video Call' ? formatCallTime(String(r.video_call_time || '').trim()) : r.expected_completion_time || '',
+    CREName: r.cre_name || '',
+    type: r.type,
+  }));
+}
+
+const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
 export default function Dashboard() {
   const { user } = useAuthStore();
-  const [videoCallStats, setVideoCallStats] = useState({ pending: 0, solved: 0 });
-  const [materialTestingStats, setMaterialTestingStats] = useState({ pending: 0, completed: 0 });
-
-  const [allTickets, setAllTickets] = useState([]);
-  const [allQcChecks, setAllQcChecks] = useState([]);
-
+  const queryClient = useQueryClient();
   const [vcSearchTerm, setVcSearchTerm] = useState('');
   const [vcStatusFilter, setVcStatusFilter] = useState('all');
 
   const [mtSearchTerm, setMtSearchTerm] = useState('');
   const [mtStatusFilter, setMtStatusFilter] = useState('all');
 
-  const [statsLoading, setStatsLoading] = useState(false);
-
   const [isCalendarModalOpen, setIsCalendarModalOpen] = useState(false);
   const [isTodayAvailabilityOpen, setIsTodayAvailabilityOpen] = useState(false);
-  const [siteVisitHistory, setSiteVisitHistory] = useState([]);
-  const [masterData, setMasterData] = useState([]);
+  const [calRange, setCalRange] = useState(null); // visible calendar window { start, end }
 
-  // Same Pending/History rule as the Material Testing page: a lift's own
-  // pendingQty > 0 is Pending, 0 is Completed; cancelled indents are not Pending.
-  const loadQcStats = async () => {
-    try {
-      const res = await fetch('/api/material-testing');
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+  const isEngineer = user?.role === 'ENGINEER';
+  const scope = useMemo(
+    () => (isEngineer ? scopeBy(['engineer_assign'], [user?.name, user?.id]) : null),
+    [isEngineer, user?.name, user?.id]
+  );
+  const scopeKey = isEngineer ? `eng:${user?.id}` : 'all';
+  const debouncedVcSearch = useDebounced(vcSearchTerm, 350);
 
-      const cancelled = new Set(body.cancelledNos || []);
-      const first = (v) => (Array.isArray(v) ? v[0] || {} : v || {});
-      let pending = 0;
-      let completed = 0;
-      const rows = [];
-      (body.testings || []).forEach((t) => {
-        const lift = t.lift || {};
-        const indent = lift.indent || {};
-        const received = first(lift.materialReceived);
-        const receivedQty = parseFloat(received.receivedQty || 0);
-        const pendingQty = t.pendingQty ?? receivedQty;
-        const status = pendingQty > 0 ? 'pending' : 'completed';
-        if (status === 'pending' && cancelled.has(indent.indentNo)) return;
+  const vcPendingQ = useQuery({ queryKey: ['dash', 'vc-count', 'pending', scopeKey], queryFn: () => countView(VC_VIEWS.pending, { scope }) });
+  const vcSolvedQ = useQuery({ queryKey: ['dash', 'vc-count', 'solved', scopeKey], queryFn: () => countView(VC_VIEWS.history, { scope }) });
+  const vcView = vcStatusFilter === 'pending' ? VC_VIEWS.pending : vcStatusFilter === 'solved' ? VC_VIEWS.history : VC_VIEWS.all;
+  const vcListQ = useQuery({
+    queryKey: ['dash', 'vc-list', vcView, scopeKey, debouncedVcSearch],
+    queryFn: () => fetchViewPage(vcView, { page: 1, pageSize: 8, search: debouncedVcSearch, scope, order: [{ column: 'ticket_created_at', ascending: false }] }),
+    placeholderData: keepPreviousData,
+  });
+  const debouncedMtSearch = useDebounced(mtSearchTerm, 350);
+  const mtTab = mtStatusFilter === 'pending' ? 'pending' : mtStatusFilter === 'completed' ? 'history' : 'all';
+  const qcQ = useQuery({
+    queryKey: ['dash', 'qc', mtTab, debouncedMtSearch],
+    queryFn: () => fetchQc({ tab: mtTab, search: debouncedMtSearch }),
+    placeholderData: keepPreviousData,
+    staleTime: 60_000,
+  });
+  const engineersQ = useQuery({ queryKey: ['dash', 'engineers'], queryFn: loadEngineerNames, staleTime: 10 * 60_000 });
+  const calQ = useQuery({
+    queryKey: ['dash', 'cal', calRange?.start, calRange?.end, scopeKey],
+    enabled: isCalendarModalOpen && !!calRange,
+    queryFn: () => fetchCalendarEvents(calRange, scope),
+    placeholderData: keepPreviousData,
+  });
+  const todayStr = ymd(new Date());
+  const todayQ = useQuery({
+    queryKey: ['dash', 'cal', todayStr, todayStr, 'all'],
+    enabled: isTodayAvailabilityOpen,
+    queryFn: () => fetchCalendarEvents({ start: todayStr, end: todayStr }, null),
+  });
 
-        rows.push({
-          id: rows.length + 1,
-          indentNumber: String(indent.indentNo || '').trim(),
-          liftNo: String(lift.liftNo || '').trim(),
-          itemName: String(indent.itemName || '').trim(),
-          receivedQty: received.receivedQty || '0',
-          approvedQty: t.approvedQty || 0,
-          status,
-        });
-        if (status === 'pending') pending++;
-        else completed++;
-      });
-      return { pending, completed, rows: rows.reverse() };
-    } catch (err) {
-      console.error('Error loading QC stats:', err);
-      return { pending: 0, completed: 0, rows: [] };
-    }
-  };
+  const statsLoading = vcPendingQ.isPending || vcSolvedQ.isPending || qcQ.isPending;
+  const videoCallStats = { pending: vcPendingQ.data ?? 0, solved: vcSolvedQ.data ?? 0 };
+  const materialTestingStats = { pending: qcQ.data?.counts?.pending ?? 0, completed: qcQ.data?.counts?.completed ?? 0 };
+  const masterData = useMemo(() => [{ "Engineer Assign Name": engineersQ.data || [] }], [engineersQ.data]);
+  // Today's events for every engineer — what Today's Availability works from.
+  const siteVisitHistory = useMemo(() => todayQ.data || [], [todayQ.data]);
+  const calendarEvents = useMemo(() => calQ.data || [], [calQ.data]);
+  const filteredTickets = useMemo(() => (vcListQ.data?.rows || []).map(mapVcRow), [vcListQ.data]);
 
-  const fetchDashboardStats = async () => {
-    setStatsLoading(true);
-    try {
-      // Video-Call gating: same rule as Video-Call.jsx — a ticket is
-      // "in Video-Call" once sss_warranty_check.video_call_planned is set;
-      // pending until the latest sss_video_call attempt lands on something
-      // other than 'rescheduled'.
-      const { data: warrantyRows, error: warrantyError } = await supabase
-        .from('sss_warranty_check')
-        .select('ticket_id, video_call_planned')
-        .not('video_call_planned', 'is', null);
-      if (warrantyError) throw warrantyError;
-
-      const vcTicketIds = [...new Set((warrantyRows || []).map((w) => w.ticket_id))];
-
-      const [
-        vcTicketsRes,
-        vcAttemptsRes,
-        siteVisitRes,
-        tadaRes,
-        warehouseRes,
-        engineerDropdownRes,
-        qcStats,
-      ] = await Promise.all([
-        vcTicketIds.length
-          ? supabase.from('sss_tickets').select('*').in('ticket_id', vcTicketIds)
-          : Promise.resolve({ data: [] }),
-        vcTicketIds.length
-          ? supabase.from('sss_video_call').select('*').in('ticket_id', vcTicketIds).order('created_at', { ascending: false })
-          : Promise.resolve({ data: [] }),
-        supabase.from('sss_site_visit').select('*'),
-        supabase.from('sss_tada').select('*'),
-        supabase.from('sss_warehouse').select('*'),
-        supabase.from('sss_dropdown').select('value').eq('category', 'engineer_assign_name'),
-        // Material testing lives in the separate PFMS project (RLS, no anon policy) —
-        // read through the server-side proxy, never directly. Isolated so a QC
-        // failure can't take the Video Call / Site Visit stats down with it.
-        loadQcStats(),
-      ]);
-
-      if (vcTicketsRes.error) throw vcTicketsRes.error;
-      if (vcAttemptsRes.error) throw vcAttemptsRes.error;
-      if (siteVisitRes.error) throw siteVisitRes.error;
-      if (tadaRes.error) throw tadaRes.error;
-      if (warehouseRes.error) throw warehouseRes.error;
-      if (engineerDropdownRes.error) throw engineerDropdownRes.error;
-
-      // ---- Video Call pending/solved stats ----
-      const latestAttemptByTicket = new Map();
-      (vcAttemptsRes.data || []).forEach((a) => {
-        if (!latestAttemptByTicket.has(a.ticket_id)) latestAttemptByTicket.set(a.ticket_id, a);
-      });
-
-      let vcPending = 0;
-      let vcSolved = 0;
-      const vcRows = (vcTicketsRes.data || [])
-        .map((t, index) => {
-          const latest = latestAttemptByTicket.get(t.ticket_id);
-          const isPending = !latest || latest.enquiry_solved === 'rescheduled';
-          if (isPending) vcPending++;
-          else vcSolved++;
-
-          return {
-            id: index + 1,
-            timeStemp: t.created_at || "",
-            ticketId: t.ticket_id || "",
-            clientName: t.client_name || "",
-            companyName: t.company_name || "",
-            category: t.category || "",
-            phoneNumber: t.phone_number || "",
-            actual2: isPending ? "" : String(latest.created_at || "").trim(),
-          };
-        })
-        .reverse();
-
-      // ---- Engineer calendar: Site Visit + Video Call + Repair history ----
-      const calendarTicketUuids = [
-        ...new Set([
-          ...(siteVisitRes.data || []).map((s) => s.ticket_uuid),
-          ...(warehouseRes.data || []).map((w) => w.ticket_uuid),
-        ]),
-      ];
-
-      const { data: calendarTickets, error: calendarTicketsError } = calendarTicketUuids.length
-        ? await supabase.from('sss_tickets').select('*').in('uuid', calendarTicketUuids)
-        : { data: [] };
-      if (calendarTicketsError) throw calendarTicketsError;
-
-      const ticketByUuid = new Map((calendarTickets || []).map((t) => [t.uuid, t]));
-      const tadaByTicketUuid = new Map((tadaRes.data || []).map((x) => [x.ticket_uuid, x]));
-
-      const siteVisitHistory = (siteVisitRes.data || []).map((sv, index) => {
-        const t = ticketByUuid.get(sv.ticket_uuid) || {};
-        const tada = tadaByTicketUuid.get(sv.ticket_uuid);
-        return {
-          id: index + 1,
-          ticketId: sv.ticket_id || t.ticket_id || "",
-          companyName: t.company_name || "",
-          clientName: t.client_name || "",
-          phoneNumber: t.phone_number || "",
-          mentionIssue: t.mention_issue || "",
-          engineerAssign: sv.engineer_assign || "",
-          dateOfVisit: sv.date_of_visit || "",
-          travelDate: tada?.travel_date || sv.date_of_visit || "",
-          returnDate: tada?.return_date || "",
-          expectedCompletionDate: tada?.expected_completion_date || "",
-          expectedCompletionTime: tada?.expected_completion_time || "",
-          CREName: t.cre_name || "",
-          type: "Site Visit",
-        };
-      });
-
-      const videoCallHistory = (vcTicketsRes.data || [])
-        .filter((t) => t.video_call === "Yes")
-        .map((t, index) => {
-          const latest = latestAttemptByTicket.get(t.ticket_id);
-          const startDate = latest?.rescheduled_time || t.created_at || "";
-          return {
-            id: index + 1,
-            ticketId: t.ticket_id || "",
-            companyName: t.company_name || "",
-            clientName: t.client_name || "",
-            phoneNumber: t.phone_number || "",
-            mentionIssue: t.mention_issue || "",
-            engineerAssign: latest?.alternate_engineer || t.engineer_assign || "",
-            dateOfVisit: startDate,
-            travelDate: startDate,
-            returnDate: startDate,
-            expectedCompletionDate: startDate,
-            expectedCompletionTime: formatCallTime(String(t.video_call_time || "").trim()),
-            CREName: t.cre_name || "",
-            type: "Video Call",
-          };
-        });
-
-      const repairHistory = (warehouseRes.data || []).map((w, index) => {
-        const t = ticketByUuid.get(w.ticket_uuid) || {};
-        const startDate = w.date_of_repair || w.created_at || "";
-        return {
-          id: index + 1,
-          ticketId: w.ticket_id || t.ticket_id || "",
-          companyName: t.company_name || "",
-          clientName: t.client_name || "",
-          phoneNumber: t.phone_number || "",
-          mentionIssue: t.mention_issue || "",
-          engineerAssign: w.assigned_engineer || "",
-          dateOfVisit: startDate,
-          travelDate: startDate,
-          returnDate: startDate,
-          expectedCompletionDate: startDate,
-          expectedCompletionTime: "",
-          CREName: t.cre_name || "",
-          type: "Repair",
-        };
-      });
-
-      const svHistory = [...siteVisitHistory, ...videoCallHistory, ...repairHistory];
-
-      const { pending: mtPending, completed: mtCompleted, rows: mtRows } = qcStats;
-
-      // ---- Engineer filter list for the calendar modal ----
-      const engineerNames = [
-        ...new Set((engineerDropdownRes.data || []).map((r) => String(r.value || "").trim()).filter(Boolean)),
-      ];
-      setMasterData([{ "Engineer Assign Name": engineerNames }]);
-
-      setVideoCallStats({ pending: vcPending, solved: vcSolved });
-      setMaterialTestingStats({ pending: mtPending, completed: mtCompleted });
-      setAllTickets(vcRows);
-      setAllQcChecks(mtRows);
-      setSiteVisitHistory(svHistory);
-    } catch (err) {
-      console.error("Error loading dashboard stats:", err);
-    } finally {
-      setStatsLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchDashboardStats();
-  }, []);
-
-  const filteredTickets = useMemo(() => {
-    return allTickets
-      .filter(ticket => {
-        if (vcStatusFilter !== 'all') {
-          const isPending = ticket.actual2 === "";
-          if (vcStatusFilter === 'pending' && !isPending) return false;
-          if (vcStatusFilter === 'solved' && isPending) return false;
-        }
-        const q = vcSearchTerm.toLowerCase().trim();
-        if (q) {
-          const matches =
-            String(ticket.ticketId || "").toLowerCase().includes(q) ||
-            String(ticket.clientName || "").toLowerCase().includes(q) ||
-            String(ticket.companyName || "").toLowerCase().includes(q) ||
-            String(ticket.category || "").toLowerCase().includes(q) ||
-            String(ticket.phoneNumber || "").includes(q);
-          if (!matches) return false;
-        }
-        return true;
-      })
-      .slice(0, 8);
-  }, [allTickets, vcSearchTerm, vcStatusFilter]);
-
-  const filteredQcChecks = useMemo(() => {
-    return allQcChecks
-      .filter(record => {
-        if (mtStatusFilter !== 'all' && record.status !== mtStatusFilter) return false;
-        const q = mtSearchTerm.toLowerCase().trim();
-        if (q) {
-          const matches =
-            String(record.indentNumber || "").toLowerCase().includes(q) ||
-            String(record.liftNo || "").toLowerCase().includes(q) ||
-            String(record.itemName || "").toLowerCase().includes(q);
-          if (!matches) return false;
-        }
-        return true;
-      })
-      .slice(0, 8);
-  }, [allQcChecks, mtSearchTerm, mtStatusFilter]);
+  const filteredQcChecks = useMemo(() => (qcQ.data?.rows || []).map(mapQcRow), [qcQ.data]);
 
   const engineersList = useMemo(() => {
     const masterEngs = masterData[0]?.["Engineer Assign Name"] || [];
@@ -628,7 +428,7 @@ export default function Dashboard() {
 
   const chartData = useMemo(() => {
     return engineersList.map((eng) => {
-      const { segments, statusText, isPendingTADA } = getTodayAvailability(eng);
+      const { segments, isPendingTADA } = getTodayAvailability(eng);
 
       let busyHours = 0;
       let pendingHours = 0;
@@ -654,6 +454,7 @@ export default function Dashboard() {
         "Available Hours": parseFloat(freeHours.toFixed(1)),
       };
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- getTodayAvailability only reads siteVisitHistory
   }, [engineersList, siteVisitHistory]);
 
   const CustomTooltip = ({ active, payload, label }) => {
@@ -689,19 +490,8 @@ export default function Dashboard() {
   // STATES
   // ==============================
 
-  const [pendingData, setPendingData] = useState([]);
-  const [fetchLoading, setFetchLoading] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [enquiryMasterData, setEnquiryMasterData] = useState([]);
-  const [searchItem, setSearchItem] = useState("");
-
-  // Filter States
-  const [dateRange, setDateRange] = useState({
-    start: "",
-    end: "",
-  });
-  const [isDateModalOpen, setIsDateModalOpen] = useState(false);
-  const [categoryFilter, setCategoryFilter] = useState("all");
 
   // New Enquiry States
   const [showNewEnquiryForm, setShowNewEnquiryForm] = useState(false);
@@ -754,11 +544,6 @@ export default function Dashboard() {
   // LOCAL STORAGE
   // ==============================
 
-  const userName = localStorage.getItem("currentUsername");
-
-  const roleStorage = localStorage.getItem("o2d-auth-storage");
-  const parsedData = roleStorage ? JSON.parse(roleStorage) : null;
-  const role = parsedData?.state?.user?.role;
 
   // ==============================
   // EFFECTS
@@ -766,7 +551,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchMasterSheet();
-    fetchData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- load the dropdown master once on mount
   }, []);
 
   useEffect(() => {
@@ -806,20 +591,6 @@ export default function Dashboard() {
   // FORMAT DATE TIME
   // ==============================
 
-  const formatDateTime = (date) => {
-    const d = new Date(date);
-
-    const day = String(d.getDate()).padStart(2, "0");
-    const month = String(d.getMonth() + 1).padStart(2, "0");
-    const year = d.getFullYear();
-
-    const hours = String(d.getHours()).padStart(2, "0");
-    const minutes = String(d.getMinutes()).padStart(2, "0");
-    const seconds = String(d.getSeconds()).padStart(2, "0");
-
-    return `${day}/${month}/${year} ${hours}:${minutes}:${seconds}`;
-  };
-
   // ==============================
   // OTP GENERATOR
   // ==============================
@@ -832,55 +603,6 @@ export default function Dashboard() {
     }
 
     return result;
-  };
-
-  const handleEditClick = (ticket) => {
-    setIsEditMode(true);
-
-    setEditingTicket(ticket);
-
-    setNewEnquiryData({
-      clientType: ticket.clientType || "New",
-      sourceOfEnquiry: ticket.sourceOfEnquiry || "",
-      callType: ticket.callType || "",
-      enquiryReceiverName: ticket.enquiryReceiverName || "",
-      companyName: ticket.companyName || "",
-      clientName: ticket.clientName || "",
-      phoneNumber: ticket.phoneNumber || "",
-      gstAddress: ticket.gstAddress || "",
-      siteAddress: ticket.siteAddress || "",
-      gstNo: ticket.gstNo || "",
-      machineName: ticket.machineName || "",
-      category: ticket.category || "",
-      mentionIssue: ticket.mentionIssue || "",
-      serviceLocation: ticket.serviceLocation || "",
-      challanCopy: ticket.challanCopy || "",
-      machinePhoto: ticket.machinePhoto || "",
-      videoCall: ticket.videoCall || "",
-      newCategory: ticket.newCategory || "",
-      videoCallTime: ticket.videoCallTime || "",
-      engineerAssign: ticket.engineerAssign || "",
-    });
-
-    const machines = ticket.machineName
-      ? ticket.machineName
-        .split(",")
-        .map((m) => m.trim())
-        .filter(Boolean)
-      : [];
-
-    setNewFormSelectedMachines(machines);
-
-    const categories = ticket.newCategory
-      ? ticket.newCategory
-        .split(",")
-        .map((c) => c.trim())
-        .filter(Boolean)
-      : [];
-
-    setNewFormSelectedCategories(categories);
-
-    setShowNewEnquiryForm(true);
   };
 
   const uploadFileToDrive = async (file, field) => {
@@ -1026,176 +748,6 @@ export default function Dashboard() {
     });
   };
 
-  const fetchData = async () => {
-    setFetchLoading(true);
-
-    try {
-      const { data, error } = await supabase
-        .from("sss_tickets")
-        .select("*")
-        .eq("current_stage", "Warranty Check")
-        .order("created_at", { ascending: false });
-
-      if (error) throw error;
-
-      const allData = (data || []).map((row, index) => ({
-        id: index + 1,
-        uuid: row.uuid,
-        timeStemp: row.created_at || "",
-        ticketId: row.ticket_id || "",
-        sourceOfEnquiry: row.source_of_enquiry || "",
-        callType: row.call_type || "",
-        enquiryReceiverName: row.enquiry_receiver_name || "",
-        clientType: row.client_type || "",
-        companyName: row.company_name || "",
-        clientName: row.client_name || "",
-        phoneNumber: row.phone_number || "",
-        gstAddress: row.gst_address || "",
-        siteAddress: row.site_address || "",
-        gstNo: row.gst_no || "",
-        machineName: row.machine_name || "",
-        category: row.category || "",
-        mentionIssue: row.mention_issue || "",
-        serviceLocation: row.service_location || "",
-        challanCopy: row.challan_copy || "",
-        machinePhoto: row.machine_photo || "",
-        videoCall: row.video_call || "",
-        engineerAssign: row.engineer_assign || "",
-        CREName: row.cre_name || "",
-        otp: row.otp || "",
-        newCategory: row.sub_category || "",
-        videoCallTime: row.video_call_time || "",
-      }));
-
-      const uniqueTicketsMap = new Map();
-
-      allData.forEach((ticket) => {
-        if (ticket.ticketId) {
-          uniqueTicketsMap.set(ticket.ticketId, ticket);
-        }
-      });
-
-      setPendingData(Array.from(uniqueTicketsMap.values()));
-    } catch (error) {
-      console.error(error);
-
-      toast.error("Failed to load data");
-    } finally {
-      setFetchLoading(false);
-    }
-  };
-
-  const roleFilteredData =
-    role === "user"
-      ? pendingData.filter(
-        (item) => item.CREName === userName
-      )
-      : role === "engineer"
-        ? pendingData.filter(
-          (item) => item.engineerAssign === userName
-        )
-        : pendingData;
-
-  const filteredPendingData = roleFilteredData
-    .filter((item) => {
-      const q = searchItem.toLowerCase();
-
-      const matchesSearch =
-        String(item.ticketId || "")
-          .toLowerCase()
-          .includes(q) ||
-        String(item.clientName || "")
-          .toLowerCase()
-          .includes(q) ||
-        String(item.companyName || "")
-          .toLowerCase()
-          .includes(q) ||
-        String(item.phoneNumber || "")
-          .toLowerCase()
-          .includes(q);
-
-      if (!matchesSearch) return false;
-
-      if (
-        categoryFilter !== "all" &&
-        item.category !== categoryFilter
-      ) {
-        return false;
-      }
-
-      if (item.timeStemp) {
-        let ticketDateObj = null;
-
-        if (
-          typeof item.timeStemp === "string" &&
-          item.timeStemp.includes("/")
-        ) {
-          const datePart = item.timeStemp.split(" ")[0];
-          const parts = datePart.split("/");
-
-          if (parts.length === 3) {
-            ticketDateObj = new Date(
-              parts[2],
-              parts[1] - 1,
-              parts[0]
-            );
-          }
-        } else {
-          ticketDateObj = new Date(item.timeStemp);
-        }
-
-        if (
-          ticketDateObj &&
-          !isNaN(ticketDateObj.getTime())
-        ) {
-          ticketDateObj.setHours(0, 0, 0, 0);
-
-          if (dateRange.start) {
-            const fromDateObj = new Date(
-              dateRange.start
-            );
-
-            fromDateObj.setHours(0, 0, 0, 0);
-
-            if (ticketDateObj < fromDateObj)
-              return false;
-          }
-
-          if (dateRange.end) {
-            const toDateObj = new Date(
-              dateRange.end
-            );
-
-            toDateObj.setHours(
-              23,
-              59,
-              59,
-              999
-            );
-
-            if (ticketDateObj > toDateObj)
-              return false;
-          }
-        }
-      } else if (
-        dateRange.start ||
-        dateRange.end
-      ) {
-        return false;
-      }
-
-      return true;
-    })
-    .reverse();
-
-  const availableCategories = [
-    ...new Set(
-      roleFilteredData
-        .map((item) => item.category)
-        .filter(Boolean)
-    ),
-  ];
-
   const handleNewEnquirySubmit = async (e) => {
     e.preventDefault();
 
@@ -1255,7 +807,6 @@ export default function Dashboard() {
     }
 
     setIsSubmitting(true);
-    const currentDateTime = formatDateTime(new Date());
 
     try {
       if (isEditMode && editingTicket) {
@@ -1318,7 +869,7 @@ export default function Dashboard() {
         setNewFormSelectedCategories([]);
         setIsEditMode(false);
         setEditingTicket(null);
-        fetchData();
+        queryClient.invalidateQueries({ queryKey: ['dash'] });
       } else {
         const isLocWarehouse = newEnquiryData.serviceLocation?.trim() === "Warehouse";
         const ticketSubmittedAt = new Date();
@@ -1346,7 +897,7 @@ export default function Dashboard() {
           engineer_assign: newEnquiryData.engineerAssign || "",
           // OTP only when Video-Call is "Yes", same as the old sheet logic.
           otp: newEnquiryData.videoCall === "Yes" ? generateSixDigitOTP() : "",
-          cre_name: userName || "",
+          cre_name: user?.name || "",
         };
 
         // Gate "Warranty Check" (the next stage) with a planned-by timestamp,
@@ -1393,7 +944,7 @@ export default function Dashboard() {
         });
         setNewFormSelectedMachines([]);
         setNewFormSelectedCategories([]);
-        fetchData();
+        queryClient.invalidateQueries({ queryKey: ['dash'] });
       }
     } catch (error) {
       console.error("Error saving enquiry:", error);
@@ -1408,7 +959,7 @@ export default function Dashboard() {
   return (
     <div className="space-y-6 flex-1 flex flex-col min-h-0 overflow-y-auto pr-1">
       {/* Dashboard Header with CTA Buttons */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-white p-4 rounded-xl border border-slate-100 shadow-sm flex-shrink-0">
+      <div className="flex flex-shrink-0 flex-col items-start justify-between gap-4 rounded-lg border bg-card p-4 shadow-sm sm:flex-row sm:items-center">
         <div>
           <h2 className="text-xl font-bold text-slate-800 tracking-tight">Engineer Dashboard</h2>
           <p className="text-xs text-slate-500 mt-1">Welcome back, {user?.name || "User"}</p>
@@ -1445,14 +996,14 @@ export default function Dashboard() {
               setNewFormSelectedCategories([]);
               setShowNewEnquiryForm(true);
             }}
-            className="bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white shadow-md flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold transition-all"
+            className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-3 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
           >
             <Plus className="h-4 w-4" />
             New Enquiry
           </button>
           <button
             onClick={() => setIsCalendarModalOpen(true)}
-            className="bg-blue-600 hover:bg-blue-700 text-white shadow-md flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold transition-all"
+            className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-3 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
             data-testid="btn-view-visit-calendar"
           >
             <Calendar className="h-4 w-4" />
@@ -1461,7 +1012,7 @@ export default function Dashboard() {
           {isAdmin && (
             <button
               onClick={() => setIsTodayAvailabilityOpen(true)}
-              className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-md flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold transition-all"
+              className="inline-flex h-9 items-center gap-2 rounded-md border border-input bg-card px-3 text-sm font-semibold text-foreground transition-colors hover:bg-accent"
               data-testid="btn-view-today-availability"
             >
               <Calendar className="h-4 w-4" />
@@ -1472,226 +1023,142 @@ export default function Dashboard() {
       </div>
 
       {/* Metric Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 flex-shrink-0">
-        <MetricCard title="Pending Video Calls" value={statsLoading ? "..." : videoCallStats.pending} icon={Phone} gradient="from-cyan-500 to-cyan-600" description="Awaiting engineer solve" />
-        <MetricCard title="Solved Video Calls" value={statsLoading ? "..." : videoCallStats.solved} icon={CheckCircle2} gradient="from-teal-500 to-teal-600" description="Total resolved tickets" />
-        <MetricCard title="Pending QC Checks" value={statsLoading ? "..." : materialTestingStats.pending} icon={ClipboardCheck} gradient="from-orange-500 to-orange-600" description="Awaiting QA inspection" />
-        <MetricCard title="Completed QC Checks" value={statsLoading ? "..." : materialTestingStats.completed} icon={CheckCircle2} gradient="from-purple-500 to-purple-600" description="Total QC items verified" />
+      <div className="grid flex-shrink-0 grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <MetricCard title="Pending Video Calls" value={statsLoading ? "…" : videoCallStats.pending} icon={Phone} tone="warning" description="Awaiting engineer solve" />
+        <MetricCard title="Solved Video Calls" value={statsLoading ? "…" : videoCallStats.solved} icon={CheckCircle2} tone="success" description="Total resolved tickets" />
+        <MetricCard title="Pending QC Checks" value={statsLoading ? "…" : materialTestingStats.pending} icon={ClipboardCheck} tone="warning" description="Awaiting QA inspection" />
+        <MetricCard title="Completed QC Checks" value={statsLoading ? "…" : materialTestingStats.completed} icon={CheckCircle2} tone="info" description="Total QC items verified" />
       </div>
 
-      {/* 2 Tables Stacked */}
-      <div className="grid grid-cols-1 lg:grid-cols-1 gap-6 pb-6">
-        {/* Video Call Latest Entries */}
-        <div className="p-5 shadow-sm space-y-4 flex flex-col min-h-[400px]">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+      {/* Latest lists */}
+      <div className="grid grid-cols-1 gap-6 pb-6 2xl:grid-cols-2">
+        {/* Video Call latest entries */}
+        <section className="flex flex-col gap-3" aria-labelledby="dash-vc-title">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
-              <h3 className="text-sm font-bold text-slate-800">Latest Video Call Tickets</h3>
-              <p className="text-[11px] text-slate-400 font-medium">Showing top 5 matching entries from all ticket logs</p>
+              <h3 id="dash-vc-title" className="text-sm font-semibold text-foreground">Latest Video Call Tickets</h3>
+              <p className="text-xs text-muted-foreground">Newest 8 matching tickets</p>
             </div>
-
             <div className="flex items-center gap-2">
               <select
+                aria-label="Video call status"
                 value={vcStatusFilter}
                 onChange={(e) => setVcStatusFilter(e.target.value)}
-                className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-1 text-slate-650 focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer h-8"
+                className="h-9 rounded-md border border-input bg-card px-3 text-sm text-foreground focus:border-primary focus:outline-none"
               >
                 <option value="all">All Statuses</option>
                 <option value="pending">Pending</option>
                 <option value="solved">Solved</option>
               </select>
-
-              <div className="relative">
-                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-400" />
-                <input
-                  type="text"
-                  placeholder="Search tickets..."
-                  value={vcSearchTerm}
-                  onChange={(e) => setVcSearchTerm(e.target.value)}
-                  className="pl-8 pr-3 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs w-44 focus:outline-none focus:ring-1 focus:ring-indigo-500 h-8"
-                />
-              </div>
+              <FilterSearch value={vcSearchTerm} onChange={setVcSearchTerm} placeholder="Search tickets..." className="!min-w-[160px] w-44 flex-none" />
             </div>
           </div>
-
-          <div className="flex-1 min-h-0 flex flex-col justify-between">
-            <div className="hidden sm:flex flex-col flex-1 min-h-0">
-              <TableWrapper
-                headers={['Ticket-ID', 'Date', 'Client', 'Category', 'Phone Number', 'Status']}
-                data={filteredTickets}
-                loading={statsLoading}
-                emptyMessage="No tickets found."
-                renderRow={(ticket) => (
-                  <tr key={ticket.id} className="hover:bg-slate-50 transition-colors">
-                    <td className="px-5 py-3">
-                      <span className="text-xs font-mono font-bold bg-slate-100 px-1.5 py-0.5 rounded text-slate-700">{ticket.ticketId}</span>
-                    </td>
-                    <td className="px-5 py-3 text-xs text-slate-500 whitespace-nowrap">{formatDate(ticket.timeStemp)}</td>
-                    <td className="px-5 py-3 text-xs font-semibold text-slate-850 truncate max-w-[150px]" title={ticket.clientName || ticket.companyName}>{ticket.clientName || ticket.companyName}</td>
-                    <td className="px-5 py-3 text-xs text-slate-650 truncate max-w-[120px]" title={ticket.category}>{ticket.category}</td>
-                    <td className="px-5 py-3 text-xs text-slate-600 whitespace-nowrap">{ticket.phoneNumber || "-"}</td>
-                    <td className="px-5 py-3">
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${ticket.actual2 === ""
-                        ? "bg-rose-50 text-rose-700 border-rose-100"
-                        : "bg-emerald-50 text-emerald-700 border-emerald-100"
-                        }`}>
-                        {ticket.actual2 === "" ? "Pending" : "Solved"}
-                      </span>
-                    </td>
-                  </tr>
-                )}
-              />
-            </div>
-            {/* Mobile View */}
-            <div className="sm:hidden flex flex-col space-y-3 mt-1 overflow-y-auto max-h-[350px] pr-1">
-              {statsLoading ? (
-                <div className="flex justify-center py-8 text-indigo-600"><LoaderIcon className="animate-spin" /></div>
-              ) : filteredTickets.length === 0 ? (
-                <div className="text-center py-8 text-slate-400 text-sm">No tickets found.</div>
-              ) : (
-                filteredTickets.map((ticket) => (
-                  <div key={ticket.id} className="p-4 bg-slate-50 rounded-xl border border-slate-100 space-y-2">
-                    <div className="flex justify-between items-start">
-                      <span className="text-xs font-mono font-bold bg-white px-2 py-0.5 rounded text-slate-700 border border-slate-200">{ticket.ticketId}</span>
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${ticket.actual2 === ""
-                        ? "bg-rose-50 text-rose-700 border-rose-100"
-                        : "bg-emerald-50 text-emerald-700 border-emerald-100"
-                        }`}>
-                        {ticket.actual2 === "" ? "Pending" : "Solved"}
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-2 gap-2 text-[11px] text-slate-600">
-                      <div>
-                        <span className="text-slate-400 block">Date</span>
-                        <span className="font-semibold">{formatDate(ticket.timeStemp)}</span>
-                      </div>
-                      <div>
-                        <span className="text-slate-400 block">Client</span>
-                        <span className="font-semibold block truncate" title={ticket.clientName || ticket.companyName}>{ticket.clientName || ticket.companyName}</span>
-                      </div>
-                      <div>
-                        <span className="text-slate-400 block">Category</span>
-                        <span className="font-semibold block truncate">{ticket.category}</span>
-                      </div>
-                      <div>
-                        <span className="text-slate-400 block">Phone</span>
-                        <span className="font-semibold">{ticket.phoneNumber || "-"}</span>
-                      </div>
-                    </div>
-                  </div>
-                ))
+          <div className="h-[420px]">
+            <DataTable
+              ariaLabel="Latest video call tickets"
+              headers={['Ticket-ID', 'Date', 'Client', 'Category', 'Phone Number', 'Status']}
+              data={filteredTickets}
+              loading={vcListQ.isPending}
+              error={vcListQ.error ? vcListQ.error.message : null}
+              emptyTitle="No tickets found"
+              showFooter={false}
+              minWidth="min-w-[520px]"
+              renderRow={(ticket) => (
+                <tr key={ticket.id}>
+                  <td className="px-3.5 py-2 whitespace-nowrap align-middle"><span className="rounded bg-secondary px-1.5 py-0.5 font-mono text-xs font-semibold text-foreground">{ticket.ticketId}</span></td>
+                  <td className="px-3.5 py-2 text-xs text-muted-foreground whitespace-nowrap align-middle">{formatDate(ticket.timeStemp)}</td>
+                  <td className="px-3.5 py-2 text-xs font-semibold text-foreground align-middle"><div className="max-w-[160px] truncate" title={ticket.clientName || ticket.companyName}>{ticket.clientName || ticket.companyName}</div></td>
+                  <td className="px-3.5 py-2 text-xs text-foreground align-middle"><div className="max-w-[120px] truncate" title={ticket.category}>{ticket.category || '-'}</div></td>
+                  <td className="px-3.5 py-2 text-xs text-foreground whitespace-nowrap align-middle">{ticket.phoneNumber || "-"}</td>
+                  <td className="px-3.5 py-2 align-middle"><StatusBadge tone={ticket.actual2 === "" ? "warning" : "success"}>{ticket.actual2 === "" ? "Pending" : "Solved"}</StatusBadge></td>
+                </tr>
               )}
-            </div>
+              renderCard={(ticket) => (
+                <div key={ticket.id} className="space-y-2 rounded-lg border bg-card p-3 text-xs shadow-sm">
+                  <div className="flex items-start justify-between">
+                    <span className="rounded bg-secondary px-1.5 py-0.5 font-mono font-semibold">{ticket.ticketId}</span>
+                    <StatusBadge tone={ticket.actual2 === "" ? "warning" : "success"}>{ticket.actual2 === "" ? "Pending" : "Solved"}</StatusBadge>
+                  </div>
+                  <dl className="grid grid-cols-2 gap-2">
+                    <div><dt className="text-muted-foreground">Date</dt><dd className="font-semibold">{formatDate(ticket.timeStemp)}</dd></div>
+                    <div><dt className="text-muted-foreground">Client</dt><dd className="truncate font-semibold" title={ticket.clientName || ticket.companyName}>{ticket.clientName || ticket.companyName}</dd></div>
+                    <div><dt className="text-muted-foreground">Category</dt><dd className="truncate font-semibold">{ticket.category || '-'}</dd></div>
+                    <div><dt className="text-muted-foreground">Phone</dt><dd className="font-semibold">{ticket.phoneNumber || "-"}</dd></div>
+                  </dl>
+                </div>
+              )}
+            />
           </div>
-        </div>
+        </section>
 
-        {/* Material Testing Latest Entries */}
-        <div className="p-5 shadow-sm space-y-4 flex flex-col min-h-[400px]">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        {/* Material Testing latest entries */}
+        <section className="flex flex-col gap-3" aria-labelledby="dash-qc-title">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
-              <h3 className="text-sm font-bold text-slate-800">Latest QC Inspections</h3>
-              <p className="text-[11px] text-slate-400 font-medium">Showing top 5 matching entries from all QC logs</p>
+              <h3 id="dash-qc-title" className="text-sm font-semibold text-foreground">Latest QC Inspections</h3>
+              <p className="text-xs text-muted-foreground">Newest 8 matching inspections</p>
             </div>
-
             <div className="flex items-center gap-2">
               <select
+                aria-label="QC status"
                 value={mtStatusFilter}
                 onChange={(e) => setMtStatusFilter(e.target.value)}
-                className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-1 text-slate-650 focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer h-8"
+                className="h-9 rounded-md border border-input bg-card px-3 text-sm text-foreground focus:border-primary focus:outline-none"
               >
                 <option value="all">All Statuses</option>
                 <option value="pending">Pending</option>
                 <option value="completed">Completed</option>
               </select>
-
-              <div className="relative">
-                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-400" />
-                <input
-                  type="text"
-                  placeholder="Search QC..."
-                  value={mtSearchTerm}
-                  onChange={(e) => setMtSearchTerm(e.target.value)}
-                  className="pl-8 pr-3 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs w-44 focus:outline-none focus:ring-1 focus:ring-indigo-500 h-8"
-                />
-              </div>
+              <FilterSearch value={mtSearchTerm} onChange={setMtSearchTerm} placeholder="Search QC..." className="!min-w-[160px] w-44 flex-none" />
             </div>
           </div>
-
-          <div className="flex-1 min-h-0 flex flex-col justify-between">
-            <div className="hidden sm:flex flex-col flex-1 min-h-0">
-              <TableWrapper
-                headers={['Indent No.', 'Unit Tracking No.', 'Item', 'Total Qty', 'Approved Qty', 'Status']}
-                data={filteredQcChecks}
-                loading={statsLoading}
-                emptyMessage="No QC inspections found."
-                renderRow={(record) => (
-                  <tr key={record.id} className="hover:bg-slate-50 transition-colors">
-                    <td className="px-5 py-3 font-bold text-xs text-slate-700">{record.indentNumber}</td>
-                    <td className="px-5 py-3 text-xs text-slate-600">{record.liftNo}</td>
-                    <td className="px-5 py-3 text-xs font-semibold text-slate-850 truncate max-w-[180px]" title={record.itemName}>{record.itemName}</td>
-                    <td className="px-5 py-3 text-xs font-bold text-slate-700">{record.receivedQty}</td>
-                    <td className="px-5 py-3 text-xs font-bold text-emerald-600">{record.approvedQty}</td>
-                    <td className="px-5 py-3">
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${record.status === "pending"
-                        ? "bg-orange-50 text-orange-700 border-orange-100"
-                        : "bg-purple-50 text-purple-700 border-purple-100"
-                        }`}>
-                        {record.status === "pending" ? "Pending" : "Completed"}
-                      </span>
-                    </td>
-                  </tr>
-                )}
-              />
-            </div>
-            {/* Mobile View */}
-            <div className="sm:hidden flex flex-col space-y-3 mt-1 overflow-y-auto max-h-[350px] pr-1">
-              {statsLoading ? (
-                <div className="flex justify-center py-8 text-indigo-600"><LoaderIcon className="animate-spin" /></div>
-              ) : filteredQcChecks.length === 0 ? (
-                <div className="text-center py-8 text-slate-400 text-sm">No QC inspections found.</div>
-              ) : (
-                filteredQcChecks.map((record) => (
-                  <div key={record.id} className="p-4 bg-slate-50 rounded-xl border border-slate-100 space-y-2">
-                    <div className="flex justify-between items-start">
-                      <span className="text-xs font-bold text-slate-700 bg-white px-2 py-0.5 rounded border border-slate-200">{record.indentNumber}</span>
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${record.status === "pending"
-                        ? "bg-orange-50 text-orange-700 border-orange-100"
-                        : "bg-purple-50 text-purple-700 border-purple-100"
-                        }`}>
-                        {record.status === "pending" ? "Pending" : "Completed"}
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-2 gap-2 text-[11px] text-slate-600">
-                      <div>
-                        <span className="text-slate-400 block">Unit Tracking No.</span>
-                        <span className="font-semibold">{record.liftNo}</span>
-                      </div>
-                      <div>
-                        <span className="text-slate-400 block">Item</span>
-                        <span className="font-semibold block truncate" title={record.itemName}>{record.itemName}</span>
-                      </div>
-                      <div>
-                        <span className="text-slate-400 block">Total Qty</span>
-                        <span className="font-semibold">{record.receivedQty}</span>
-                      </div>
-                      <div>
-                        <span className="text-slate-400 block">Approved Qty</span>
-                        <span className="font-semibold text-emerald-600">{record.approvedQty}</span>
-                      </div>
-                    </div>
-                  </div>
-                ))
+          <div className="h-[420px]">
+            <DataTable
+              ariaLabel="Latest QC inspections"
+              headers={['Indent No.', 'Unit Tracking No.', 'Item', 'Total Qty', 'Approved Qty', 'Status']}
+              data={filteredQcChecks}
+              loading={qcQ.isPending}
+              error={qcQ.error ? qcQ.error.message : null}
+              emptyTitle="No QC inspections found"
+              showFooter={false}
+              minWidth="min-w-[560px]"
+              renderRow={(record) => (
+                <tr key={record.id}>
+                  <td className="px-3.5 py-2 text-xs font-semibold text-foreground align-middle">{record.indentNumber}</td>
+                  <td className="px-3.5 py-2 text-xs text-foreground align-middle">{record.liftNo}</td>
+                  <td className="px-3.5 py-2 text-xs font-semibold text-foreground align-middle"><div className="max-w-[180px] truncate" title={record.itemName}>{record.itemName}</div></td>
+                  <td className="px-3.5 py-2 text-xs font-semibold text-foreground align-middle">{record.receivedQty}</td>
+                  <td className="px-3.5 py-2 text-xs font-semibold text-success align-middle">{record.approvedQty}</td>
+                  <td className="px-3.5 py-2 align-middle"><StatusBadge tone={record.status === "pending" ? "warning" : "info"}>{record.status === "pending" ? "Pending" : "Completed"}</StatusBadge></td>
+                </tr>
               )}
-            </div>
+              renderCard={(record) => (
+                <div key={record.id} className="space-y-2 rounded-lg border bg-card p-3 text-xs shadow-sm">
+                  <div className="flex items-start justify-between">
+                    <span className="rounded bg-secondary px-1.5 py-0.5 font-semibold">{record.indentNumber}</span>
+                    <StatusBadge tone={record.status === "pending" ? "warning" : "info"}>{record.status === "pending" ? "Pending" : "Completed"}</StatusBadge>
+                  </div>
+                  <dl className="grid grid-cols-2 gap-2">
+                    <div><dt className="text-muted-foreground">Unit Tracking No.</dt><dd className="font-semibold">{record.liftNo}</dd></div>
+                    <div><dt className="text-muted-foreground">Item</dt><dd className="truncate font-semibold" title={record.itemName}>{record.itemName}</dd></div>
+                    <div><dt className="text-muted-foreground">Total Qty</dt><dd className="font-semibold">{record.receivedQty}</dd></div>
+                    <div><dt className="text-muted-foreground">Approved Qty</dt><dd className="font-semibold text-success">{record.approvedQty}</dd></div>
+                  </dl>
+                </div>
+              )}
+            />
           </div>
-        </div>
+        </section>
       </div>
 
       {/* Visit Calendar Modal */}
       <VisitCalendarModal
         isOpen={isCalendarModalOpen}
         onClose={() => setIsCalendarModalOpen(false)}
-        allData={user?.role === "ENGINEER" ? siteVisitHistory.filter((item) => String(item.engineerAssign).trim().toLowerCase() === String(user.name).trim().toLowerCase()) : siteVisitHistory}
+        allData={calendarEvents}
         masterData={masterData}
+        onRangeChange={setCalRange}
+        loading={calQ.isFetching}
       />
 
       {/* Today's Availability Dialog Modal */}

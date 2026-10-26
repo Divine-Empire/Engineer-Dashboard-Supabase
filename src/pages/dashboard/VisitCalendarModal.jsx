@@ -176,7 +176,9 @@ const formatMinutesToTime = (min) => {
   return `${hrs}:${minStr} ${ampm}`;
 };
 
-export default function VisitCalendarModal({ isOpen, onClose, allData = [], masterData = [] }) {
+// `allData` is only the events overlapping the visible window; the modal reports that window through
+// `onRangeChange({ start, end })` (YYYY-MM-DD) on open and on every month/week change so the parent fetches just that.
+export default function VisitCalendarModal({ isOpen, onClose, allData = [], masterData = [], onRangeChange, loading = false }) {
   const { user } = useAuthStore();
   const isAdmin = user?.role === "ADMIN";
 
@@ -284,6 +286,17 @@ export default function VisitCalendarModal({ isOpen, onClose, allData = [], mast
       return cells;
     }
   }, [currentMonth, currentYear, viewMode, currentDate]);
+
+  useEffect(() => {
+    if (!isOpen || !onRangeChange) return;
+    const pad = (n) => String(n).padStart(2, "0");
+    const f = calendarCells[0];
+    const l = calendarCells[calendarCells.length - 1];
+    onRangeChange({
+      start: `${f.year}-${pad(f.month + 1)}-${pad(f.day)}`,
+      end: `${l.year}-${pad(l.month + 1)}-${pad(l.day)}`,
+    });
+  }, [isOpen, calendarCells, onRangeChange]);
 
   const getDatesInRange = (startComp, endComp) => {
     const dates = [];
@@ -452,7 +465,7 @@ export default function VisitCalendarModal({ isOpen, onClose, allData = [], mast
     <Modal isOpen={isOpen} onClose={onClose} title="Engineer Visit Calendar" size="4xl">
       <div className="flex flex-col gap-4 -mt-2 relative">
         {/* Loading Spinner overlay */}
-        {isLoading && (
+        {(isLoading || loading) && (
           <div className="absolute inset-0 bg-white/70 backdrop-blur-[2px] z-20 flex items-center justify-center rounded-xl">
             <div className="flex flex-col items-center gap-2">
               <Loader2 className="h-8 w-8 text-blue-600 animate-spin" />
@@ -469,6 +482,7 @@ export default function VisitCalendarModal({ isOpen, onClose, allData = [], mast
                 variant="outline"
                 size="icon"
                 onClick={handlePrev}
+                aria-label={viewMode === "month" ? "Previous month" : "Previous week"}
                 className="h-9 w-9 text-slate-600 hover:text-blue-600 hover:border-blue-200 transition-all rounded-lg"
               >
                 <ChevronLeft className="h-5 w-5" />
@@ -481,6 +495,7 @@ export default function VisitCalendarModal({ isOpen, onClose, allData = [], mast
                 variant="outline"
                 size="icon"
                 onClick={handleNext}
+                aria-label={viewMode === "month" ? "Next month" : "Next week"}
                 className="h-9 w-9 text-slate-600 hover:text-blue-600 hover:border-blue-200 transition-all rounded-lg"
               >
                 <ChevronRight className="h-5 w-5" />
@@ -524,6 +539,7 @@ export default function VisitCalendarModal({ isOpen, onClose, allData = [], mast
             <div className="flex items-center gap-2 w-full sm:w-auto">
               <User className="h-4 w-4 text-slate-400 shrink-0" />
               <select
+                aria-label="Filter by engineer"
                 value={selectedEngineer}
                 onChange={(e) => setSelectedEngineer(e.target.value)}
                 className="w-full sm:w-56 px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm text-slate-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all cursor-pointer"
@@ -620,7 +636,8 @@ export default function VisitCalendarModal({ isOpen, onClose, allData = [], mast
                   variant="ghost"
                   size="icon"
                   onClick={() => setSelectedDayDetails(null)}
-                  className="h-7 w-7 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-colors"
+                  aria-label="Close day details"
+                  className="h-7 w-7 text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
                 >
                   <X className="h-4 w-4" />
                 </Button>

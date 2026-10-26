@@ -47,8 +47,7 @@ export default defineConfig(({ mode }) => {
         'react-dom',
         'react-router-dom',
         'lucide-react',
-        'recharts',
-        'date-fns'
+        'recharts'
       ]
     },
     server: {

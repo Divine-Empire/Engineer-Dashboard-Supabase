@@ -1,5 +1,5 @@
 import React from 'react';
-import { Bell, User, Menu, LogOut } from 'lucide-react';
+import { Menu } from 'lucide-react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '../store/authStore';
 
@@ -37,6 +37,8 @@ const Header = ({ onMenuClick, user }) => {
         {/* Left: Mobile hamburger */}
         <div className="flex items-center gap-3">
           <button
+            type="button"
+            aria-label="Open menu"
             onClick={onMenuClick}
             className="lg:hidden p-2 text-slate-500 hover:bg-slate-100 hover:text-slate-700 rounded-lg transition-colors"
           >
@@ -51,17 +53,17 @@ const Header = ({ onMenuClick, user }) => {
         <div className="flex items-center gap-2">
 
           {/* Profile */}
-          <div className="flex items-center gap-2.5 group cursor-pointer" onClick={handleLogout} title="Click to sign out">
+          <button type="button" className="flex items-center gap-2.5 group cursor-pointer" onClick={handleLogout} title="Click to sign out" aria-label={`Sign out ${user?.name || ''}`.trim()}>
             <div className="hidden sm:block text-right">
               <p className="text-xs font-bold text-slate-700">{user?.name || 'Admin'}</p>
-              <p className="text-[10px] font-semibold text-indigo-500 uppercase tracking-wider">
+              <p className="text-[10px] font-semibold text-indigo-700 uppercase tracking-wider">
                 {user?.role === 'ADMIN' ? 'Administrator' : 'Employee'}
               </p>
             </div>
             <div className="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center shadow-sm group-hover:bg-indigo-700 transition-colors">
               <span className="text-xs font-bold text-white">{(user?.name || 'A')[0].toUpperCase()}</span>
             </div>
-          </div>
+          </button>
         </div>
       </div>
     </header>

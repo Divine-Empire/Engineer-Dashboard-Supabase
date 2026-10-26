@@ -1,13 +1,9 @@
 import React from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
 import {
-  Settings,
   LogOut as LogOutIcon,
   X,
   LayoutGrid,
-  CreditCard,
-  GitCompare,
-  Megaphone,
   Wallet,
   Phone,
   Handshake,
@@ -74,14 +70,14 @@ const Sidebar = ({ isOpen, onClose }) => {
             </div>
             <span className="text-xl font-bold text-slate-800 tracking-tight">Engineer's Dashboard</span>
           </div>
-          <button onClick={onClose} className="lg:hidden p-1.5 hover:bg-slate-100 rounded-lg transition-colors">
-            <X size={18} className="text-slate-400" />
+          <button type="button" aria-label="Close menu" onClick={onClose} className="lg:hidden p-1.5 hover:bg-slate-100 rounded-lg transition-colors">
+            <X size={18} className="text-slate-500" aria-hidden="true" />
           </button>
         </div>
 
         {/* Navigation */}
-        <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5 scrollbar-hide">
-          <p className="px-3 pt-2 pb-1 text-[12px] font-bold text-slate-400 uppercase tracking-widest">Main Menu</p>
+        <nav aria-label="Main" className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5 scrollbar-hide">
+          <p className="px-3 pt-2 pb-1 text-[12px] font-bold text-slate-500 uppercase tracking-widest">Main Menu</p>
           {menuItems.map((item) => (
             <NavLink
               key={item.path}
@@ -113,12 +109,12 @@ const Sidebar = ({ isOpen, onClose }) => {
             </div>
             <div className="min-w-0">
               <p className="text-sm font-semibold text-slate-700 truncate">{user?.name || 'User'}</p>
-              <p className="text-[10px] text-slate-400 font-medium uppercase tracking-wide">{user?.role || 'EMPLOYEE'}</p>
+              <p className="text-[10px] text-slate-500 font-medium uppercase tracking-wide">{user?.role || 'EMPLOYEE'}</p>
             </div>
           </div>
           <button
             onClick={handleLogout}
-            className="flex items-center justify-center gap-2 w-full px-3 py-2 rounded-lg bg-rose-50 text-rose-600 border border-rose-100 hover:bg-rose-600 hover:text-white transition-all font-semibold text-xs"
+            className="flex items-center justify-center gap-2 w-full px-3 py-2 rounded-lg bg-rose-50 text-rose-700 border border-rose-100 hover:bg-rose-600 hover:text-white transition-all font-semibold text-xs"
           >
             <LogOutIcon size={14} />
             <span>Sign Out</span>
