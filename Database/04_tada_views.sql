@@ -9,6 +9,7 @@
 -- `id` = the ticket uuid (what the TADA form submits against).
 -- `engineer_assign` = site visit's engineer, falling back to the ticket's — the role-scope
 -- column. `created_at` = the ticket's created_at (list order, newest first).
+-- equipments_needed (text[] of equipment IDs) is appended last; see Service-Support migration 0065.
 -- Read-only, additive, safe to re-run.
 -- =====================================================================
 CREATE OR REPLACE VIEW public.engg_v_tada_all AS
@@ -53,7 +54,8 @@ SELECT
   d.expected_completion_time,
   d.otp_verification_planned,
   d.delay_minutes,
-  lower(concat_ws(' ', t.ticket_id, t.client_name, t.company_name, t.phone_number, t.machine_name)) AS search_text
+  lower(concat_ws(' ', t.ticket_id, t.client_name, t.company_name, t.phone_number, t.machine_name)) AS search_text,
+  d.equipments_needed
 FROM sv
 JOIN public.sss_tickets t ON t.uuid = sv.ticket_uuid
 LEFT JOIN public.sss_warranty_check w ON w.ticket_uuid = t.uuid

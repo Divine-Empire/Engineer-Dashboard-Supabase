@@ -13,6 +13,7 @@ import { Modal } from "../../components/ui/modal";
 import { useToast } from "../../hooks/use-toast";
 import { Loader2Icon, LoaderIcon, RefreshCw, ShieldCheck } from "lucide-react";
 import { supabase } from "../../lib/supabase/client";
+import { computeCrmVerificationPlanned } from "../../lib/supabase/stagePlanning";
 import { StatusTabs, FilterSearch, FilterChips, ColumnSelector, DataTable, StatusBadge, filterControlClass } from "../../components/shared";
 import formatDisplayDate from "../../utils/formatDate";
 import { useAuthStore } from "../../store/authStore";
@@ -277,9 +278,15 @@ export default function SiteVisitOTPVerification() {
         videoFile ? uploadToStorage(videoFile, "video") : Promise.resolve(null),
       ]);
 
+      const crmVerificationPlanned = await computeCrmVerificationPlanned(
+        selectedTicket.ticketUuid,
+        new Date()
+      );
+
       const { error } = await supabase.from("sss_otp_verification").insert({
         ticket_id: selectedTicket.ticketId,
         ticket_uuid: selectedTicket.ticketUuid,
+        crm_verification_planned: crmVerificationPlanned,
         site_visit_date: formData.siteVisitDate || null,
         otp_entered: enteredOtp,
         service_report_file: serviceReportUrl,

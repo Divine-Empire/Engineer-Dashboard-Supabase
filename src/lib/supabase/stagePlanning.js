@@ -210,6 +210,15 @@ export const STAGE_PLANNING_RULES = {
     baseTime: (ctx) => ctx.tadaSubmittedAt,
   },
 
+  // -> CRM Verification, the gate in front of Invoice for EVERY ticket.
+  //   Site-visit tickets: base time is the OTP Verification submit (sss_otp_verification.crm_verification_planned).
+  //   Other orders: base time is the Order Received submit (sss_follow_up.crm_verification_planned).
+  crmVerification: {
+    tatStageName: "CRM Verification",
+    shouldPlan: () => true,
+    baseTime: (ctx) => ctx.otpSubmittedAt || ctx.orderReceivedSubmittedAt,
+  },
+
   // Order Received -> Invoice. Every Order Received submission moves on to
   // Invoice (no branching); base time is Order Received's own submit-time
   // timestamp.
@@ -235,7 +244,9 @@ export const STAGE_PLANNING_RULES = {
   // Invoice's own submit-time timestamp.
   sparedispatch: {
     tatStageName: "Spare Dispatch",
-    shouldPlan: (ctx) => ctx.ticket?.enquiryType === "SPARE",
+    shouldPlan: (ctx) =>
+      ctx.ticket?.enquiryType === "SPARE" ||
+      String(ctx.ticket?.serviceLocation || "").trim().toLowerCase() === "warehouse",
     baseTime: (ctx) => ctx.invoiceSubmittedAt,
   },
 
@@ -293,4 +304,9 @@ export async function computeStagePlanned(stageKey, ctx) {
     getHolidayDates(),
   ]);
   return addBusinessMinutes(rule.baseTime(ctx), tatMinutes, officeHours, holidayDates).toISOString();
+}
+
+/** crm_verification_planned for an OTP Verification submit of this ticket (or null). */
+export async function computeCrmVerificationPlanned(ticketUuid, otpSubmittedAt) {
+  return computeStagePlanned("crmVerification", { otpSubmittedAt });
 }

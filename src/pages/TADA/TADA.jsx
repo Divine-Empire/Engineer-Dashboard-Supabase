@@ -7,6 +7,8 @@ import toast from "react-hot-toast";
 import { Car, Loader2Icon, RefreshCw } from "lucide-react";
 import { Textarea } from "../../components/ui/textarea";
 import { supabase } from "../../lib/supabase/client";
+import { fetchEquipmentOptions, fetchEquipmentConflicts, formatEquipments } from "../../lib/supabase/equipment";
+import EquipmentSelect from "./EquipmentSelect";
 import { sendTadaApprovalEmail } from "../../lib/notifications/email";
 import { StatusTabs, FilterSearch, FilterChips, ColumnSelector, DataTable, filterControlClass } from "../../components/shared";
 import formatDisplayDate from "../../utils/formatDate";
@@ -52,11 +54,15 @@ const COLUMNS = [
   { key: "returnDate", label: "Return Date", defaultVisible: true, tabs: ["history"] },
   { key: "destinationInput", label: "Destination", defaultVisible: true, tabs: ["history"] },
   { key: "purposeOfTravel", label: "Purpose", defaultVisible: true, tabs: ["history"] },
+  { key: "equipmentsNeeded", label: "Equipments Needed", defaultVisible: true, tabs: ["history"] },
   { key: "amount", label: "Amount", defaultVisible: true, tabs: ["history"] },
   { key: "quotationPdfLink", label: "Quotation PDF", defaultVisible: true },
 ];
 const DATE_KEYS = ["timeStemp", "dateOfVisit", "travelDate", "returnDate"];
-const WIDE_KEYS = ["mentionIssue", "gstAddress", "siteAddress", "purposeOfTravel", "destinationInput", "companyName"];
+const WIDE_KEYS = ["mentionIssue", "gstAddress", "siteAddress", "purposeOfTravel", "destinationInput", "companyName", "equipmentsNeeded"];
+
+// Equipment id -> "ID - Name", filled once the equipment list has loaded (the table re-renders after).
+let equipmentLabelById = new Map();
 
 const cleanQuotationNo = (q) => (q ? String(q).replace(/^(Quotation|Quo|QUO|Quo\.)[:\-\s.]*/i, "").trim() : "");
 
@@ -97,11 +103,13 @@ const mapRow = (r) => ({
   expectedCompletionTime: r.expected_completion_time || "",
   otpVerificationPlanned: r.otp_verification_planned || "",
   delayMinutes: r.delay_minutes,
+  equipmentsNeeded: r.equipments_needed || [],
 });
 
 function cellText(key, t) {
   if (DATE_KEYS.includes(key)) return t[key] ? formatDisplayDate(t[key]) : "";
   if (key === "quotationNo") return cleanQuotationNo(t.quotationNo);
+  if (key === "equipmentsNeeded") return formatEquipments(t.equipmentsNeeded, equipmentLabelById);
   if (key === "amount") return `₹${t.amount || "0"}`;
   return t[key] || "";
 }
@@ -182,6 +190,33 @@ export default function TADA() {
   const [isCancelled, setIsCancelled] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const { user } = useAuthStore();
+  const [equipmentOptions, setEquipmentOptions] = useState([]);
+  const [equipmentConflicts, setEquipmentConflicts] = useState([]);
+
+  useEffect(() => {
+    fetchEquipmentOptions()
+      .then((opts) => {
+        equipmentLabelById = new Map(opts.map((o) => [o.id, o.label]));
+        setEquipmentOptions(opts);
+      })
+      .catch((e) => console.error("Error loading equipment list:", e));
+  }, []);
+
+  // Warn (never block) when another ticket already holds a chosen item in this travel window.
+  useEffect(() => {
+    const ids = formData.equipmentsNeeded || [];
+    if (!showTADAModal || ids.length === 0 || !formData.travelDate) {
+      setEquipmentConflicts([]);
+      return;
+    }
+    let cancelled = false;
+    fetchEquipmentConflicts(ids, formData.travelDate, formData.returnDate, selectedTicket?.id)
+      .then((c) => !cancelled && setEquipmentConflicts(c))
+      .catch((e) => console.error("Error checking equipment reservations:", e));
+    return () => {
+      cancelled = true;
+    };
+  }, [showTADAModal, formData.equipmentsNeeded, formData.travelDate, formData.returnDate, selectedTicket?.id]);
 
   // Engineers only see tickets assigned to them; admins see everything and may cancel a ticket.
   const isEngineer = user?.role === "ENGINEER";
@@ -238,6 +273,7 @@ export default function TADA() {
       amount: "",
       expectedCompletionDate: "",
       expectedCompletionTime: "",
+      equipmentsNeeded: [],
       // Accounts/approval-email fields — see handleSubmit below.
       previousAdvanceDate: "",
       previousAdvanceSettlementDate: "",
@@ -253,6 +289,11 @@ export default function TADA() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+
+    if (!formData.equipmentsNeeded?.length) {
+      toast.error("Please select at least one Equipment");
+      return;
+    }
 
     if (
       !formData.previousAdvanceDate ||
@@ -288,6 +329,7 @@ export default function TADA() {
         amount: formData.amount || null,
         expected_completion_date: formData.expectedCompletionDate || null,
         expected_completion_time: formData.expectedCompletionTime || null,
+        equipments_needed: formData.equipmentsNeeded,
         previous_advance_date: formData.previousAdvanceDate || null,
         previous_advance_settlement_date: formData.previousAdvanceSettlementDate || null,
         previous_advance_balance: formData.previousAdvanceBalance || null,
@@ -675,6 +717,18 @@ export default function TADA() {
                       required
                       data-testid="input-expected-completion-time"
                       className="border-gray-300 rounded-lg py-2 px-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                    />
+                  </div>
+
+                  <div className="md:col-span-2 space-y-1">
+                    <Label className="text-gray-600 font-medium">
+                      Equipments Needed *
+                    </Label>
+                    <EquipmentSelect
+                      options={equipmentOptions}
+                      value={formData.equipmentsNeeded || []}
+                      onChange={(ids) => handleInputChange("equipmentsNeeded", ids)}
+                      conflicts={equipmentConflicts}
                     />
                   </div>
 
