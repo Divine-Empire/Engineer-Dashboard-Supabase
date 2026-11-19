@@ -13,6 +13,7 @@ import { Modal } from "../../components/ui/modal";
 import { useToast } from "../../hooks/use-toast";
 import { Loader2Icon, LoaderIcon, RefreshCw, ShieldCheck } from "lucide-react";
 import { supabase } from "../../lib/supabase/client";
+import { sendSiteVisitOtpNotification } from "../../lib/notifications/whatsapp";
 import { computeCrmVerificationPlanned } from "../../lib/supabase/stagePlanning";
 import { StatusTabs, FilterSearch, FilterChips, ColumnSelector, DataTable, StatusBadge, filterControlClass } from "../../components/shared";
 import formatDisplayDate from "../../utils/formatDate";
@@ -385,8 +386,28 @@ export default function SiteVisitOTPVerification() {
 
       toast({
         title: "Success",
-        description: "OTP sent successfully",
+        description: "OTP saved. Sending WhatsApp notification...",
       });
+
+      // A WhatsApp failure is reported but never rolled back: the OTP already exists in the DB.
+      const { success, error: sendError } = await sendSiteVisitOtpNotification({
+        clientPhoneNumber: selectedTicket.phoneNumber,
+        clientName: selectedTicket.clientName,
+        otp: sixDigitNumber1,
+      });
+
+      if (!success) {
+        toast({
+          title: "WhatsApp notification not sent",
+          description: sendError || "OTP was saved, but the WhatsApp message could not be sent. Please share it manually.",
+          variant: "destructive",
+        });
+      } else {
+        toast({
+          title: "Success",
+          description: "OTP sent to the client over WhatsApp",
+        });
+      }
     } catch (error) {
       console.error("Error generating OTP:", error);
       toast({
