@@ -553,6 +553,7 @@ export default function TADA() {
             <tr key={ticket.id}>
               {isPending && (
                 <td className="px-3.5 py-2 align-middle">
+                  <div className="flex items-center gap-2 whitespace-nowrap">
                   <button
                     type="button"
                     onClick={() => handleTADAClick(ticket)}
@@ -567,10 +568,11 @@ export default function TADA() {
                     onClick={() => { setRescheduleRemarks(""); setRescheduleTicket(ticket); }}
                     data-testid={`button-reschedule-${ticket.ticketId}`}
                     title="Send this ticket back to Site Visit Plan for re-assignment"
-                    className="ml-2 inline-flex h-8 items-center rounded-md border border-input bg-card px-3 text-xs font-semibold text-foreground transition-colors hover:bg-accent"
+                    className="inline-flex h-8 items-center rounded-md border border-input bg-card px-3 text-xs font-semibold text-foreground transition-colors hover:bg-accent"
                   >
                     Reschedule
                   </button>
+                  </div>
                 </td>
               )}
               {list.activeColumns.map((c) => renderCell(c.key, ticket))}
