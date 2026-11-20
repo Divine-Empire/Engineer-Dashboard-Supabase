@@ -6,6 +6,8 @@ import formatDate from '../../utils/formatDate';
 import toast from 'react-hot-toast';
 import { supabase } from '../../lib/supabase/client';
 import { fetchDropdownRows } from '../../lib/supabase/dropdown';
+import { fetchItemNames } from '../../lib/supabase/items';
+import { sendVideoCallOtpResendNotification } from '../../lib/notifications/whatsapp';
 import { useAuthStore } from '../../store/authStore';
 import { useStageList, PAGE_SIZES } from '../../hooks/use-stage-list';
 import { scopeBy } from '../../lib/pagedView';
@@ -34,6 +36,8 @@ const ALL_COLUMNS = [
   { key: 'mentionIssue', label: 'Mention Issue', defaultVisible: true },
   { key: 'remarks', label: 'Video Call Remarks', defaultVisible: true, tabs: ['history'] },
   { key: 'engineerAssign', label: 'Engineer Assign', defaultVisible: true, adminOnly: true },
+  { key: 'videoCallServicesSolve', label: 'Video Call Services Solve', defaultVisible: true, tabs: ['history'] },
+  { key: 'otpVerifications', label: 'OTP Verifications', defaultVisible: true, tabs: ['history'] },
   { key: 'enquiryItemList', label: 'Enquiry Item List', defaultVisible: true },
   { key: 'videoCallTime', label: 'Call Time', defaultVisible: true },
   { key: 'timeStemp', label: 'Date', defaultVisible: true },
@@ -47,6 +51,19 @@ const ALL_COLUMNS = [
   { key: 'category', label: 'Category', defaultVisible: false },
   { key: 'serviceLocation', label: 'Service Location', defaultVisible: false },
 ];
+
+// "HH:MM" (24h) -> "hh:mm AM/PM" for the OTP-resend WhatsApp message
+const formatTime12hrFromHHMM = (timeStr) => {
+  if (!timeStr || !timeStr.includes(":")) return timeStr || "";
+  const [hStr, mStr] = timeStr.split(":");
+  let h = parseInt(hStr, 10);
+  const m = parseInt(mStr, 10);
+  if (isNaN(h) || isNaN(m)) return timeStr;
+  const period = h >= 12 ? "PM" : "AM";
+  h = h % 12;
+  if (h === 0) h = 12;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")} ${period}`;
+};
 
 const formatCallTime = (timeStr) => {
   if (!timeStr) return "";
@@ -139,15 +156,17 @@ const mapRow = (r) => {
 const DROPDOWN_CATEGORY_TO_KEY = {
   service_location: 'Service Location',
   engineer_assign_name: 'Engineer Assign Name',
-  item_name: 'Item-Name',
 };
 
 // Paginated fetch — a plain unpaginated .select() silently truncates at Supabase's default
 // 1000-row cap, which item_name alone blows past on its own (~1400 rows), dropping other
 // categories' values.
 async function loadMasterData() {
-  const data = await fetchDropdownRows(Object.keys(DROPDOWN_CATEGORY_TO_KEY));
-  const structuredData = {};
+  const [data, itemNames] = await Promise.all([
+    fetchDropdownRows(Object.keys(DROPDOWN_CATEGORY_TO_KEY)),
+    fetchItemNames(), // item catalog = lto_items (the 'item_name' dropdown category is retired)
+  ]);
+  const structuredData = { 'Item-Name': itemNames };
   (data || []).forEach(({ category, value }) => {
     const key = DROPDOWN_CATEGORY_TO_KEY[category];
     if (!key) return;
@@ -186,6 +205,13 @@ function renderCell(key, t) {
           )}
         </td>
       );
+    case 'videoCallServicesSolve':
+      return <td key={key} className="px-3.5 py-2 text-xs align-middle"><StatusBadge tone={t.videoCallServicesSolve === 'yes' ? 'success' : 'danger'}>{t.videoCallServicesSolve === 'yes' ? 'Yes' : 'No'}</StatusBadge></td>;
+    case 'otpVerifications': {
+      const verified = t.otpVarificationStatus === 'Yes' || t.otpVarificationStatus === 'Verified';
+      const skipped = t.otpVarificationStatus === 'Skipped';
+      return <td key={key} className="px-3.5 py-2 text-xs align-middle"><StatusBadge tone={verified ? 'success' : skipped ? 'info' : 'danger'}>{verified ? 'Verified' : skipped ? 'Skipped' : 'Not Verified'}</StatusBadge></td>;
+    }
     case 'videoCallTime':
       return <Cell key={key}>{t.videoCallTime || 'N/A'}</Cell>;
     default:
@@ -294,7 +320,7 @@ export default function VideoCall() {
                     Solution
                   </button>
                 ) : (
-                  <StatusBadge tone="success">Solved</StatusBadge>
+                  <StatusBadge tone={ticket.videoCallServicesSolve === 'yes' ? 'success' : 'danger'}>{ticket.videoCallServicesSolve === 'yes' ? 'Solved' : 'Not Solved'}</StatusBadge>
                 )}
               </td>
               {list.activeColumns.map((c) => renderCell(c.key, ticket))}
@@ -316,7 +342,7 @@ export default function VideoCall() {
                     Solution
                   </button>
                 ) : (
-                  <StatusBadge tone="success">Solved</StatusBadge>
+                  <StatusBadge tone={ticket.videoCallServicesSolve === 'yes' ? 'success' : 'danger'}>{ticket.videoCallServicesSolve === 'yes' ? 'Solved' : 'Not Solved'}</StatusBadge>
                 )}
               </div>
               <dl className="grid grid-cols-2 gap-x-3 gap-y-2 border-t pt-2">
@@ -485,7 +511,25 @@ function SolutionModal({ isOpen, onClose, sale, onSave, masterData }) {
 
       sale.afterVideoCallGenerateOTP = sixDigitNumber;
       sale.otp = sixDigitNumber;
-      toast.success("OTP sent successfully");
+      toast.success("OTP saved. Sending WhatsApp notification...");
+
+      // A WhatsApp failure is reported but never rolled back: the OTP is already saved.
+      sendVideoCallOtpResendNotification({
+        clientPhoneNumber: sale.phoneNumber,
+        clientName: sale.clientName,
+        ticketId: sale.ticketId,
+        issue: sale.mentionIssue,
+        engineerName: sale.engineerAssign,
+        dateStr: formatDate(sale.timeStemp),
+        timeStr: formatTime12hrFromHHMM(sale.videoCallTime),
+        otp: sixDigitNumber,
+      }).then(({ success, error: sendError }) => {
+        if (success) {
+          toast.success("OTP sent to the client over WhatsApp");
+        } else {
+          toast.error(sendError || "OTP was saved, but the WhatsApp message could not be sent. Please share it manually.");
+        }
+      });
     } catch (error) {
       console.error(error);
       toast.error("Failed to send OTP");

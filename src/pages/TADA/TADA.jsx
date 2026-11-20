@@ -47,7 +47,8 @@ const COLUMNS = [
   { key: "serviceLocation", label: "Service Location", defaultVisible: true },
   { key: "quotationNo", label: "Quotation No.", defaultVisible: true },
   { key: "warrantyCheck", label: "Warranty Check", defaultVisible: true, tabs: ["pending"] },
-  { key: "engineerAssign", label: "Engineer Assign", defaultVisible: true },
+  { key: "svEngineer", label: "Site Visit Engineer", defaultVisible: true },
+  { key: "vcEngineer", label: "Video Call Engineer", defaultVisible: true },
   { key: "dateOfVisit", label: "Date of Visit", defaultVisible: true, tabs: ["pending"] },
   { key: "transportation", label: "Transportation", defaultVisible: true, tabs: ["pending"] },
   { key: "travelDate", label: "Travel Date", defaultVisible: true, tabs: ["history"] },
@@ -56,10 +57,18 @@ const COLUMNS = [
   { key: "purposeOfTravel", label: "Purpose", defaultVisible: true, tabs: ["history"] },
   { key: "equipmentsNeeded", label: "Equipments Needed", defaultVisible: true, tabs: ["history"] },
   { key: "amount", label: "Amount", defaultVisible: true, tabs: ["history"] },
+  { key: "otpVerificationPlanned", label: "OTP Verification Planned", defaultVisible: true, tabs: ["history"] },
+  { key: "delay", label: "Delay", defaultVisible: true, tabs: ["history"] },
   { key: "quotationPdfLink", label: "Quotation PDF", defaultVisible: true },
 ];
 const DATE_KEYS = ["timeStemp", "dateOfVisit", "travelDate", "returnDate"];
 const WIDE_KEYS = ["mentionIssue", "gstAddress", "siteAddress", "purposeOfTravel", "destinationInput", "companyName", "equipmentsNeeded"];
+
+// Equipments are needed only for NABL / NON-NABL tickets (matches the SSS TADA form and DB trigger, migration 0071).
+const needsEquipmentsFor = (enquiryType) => {
+  const t = String(enquiryType || "").trim().toUpperCase();
+  return t === "NABL" || t === "NON-NABL" || t === "NON NABL";
+};
 
 // Equipment id -> "ID - Name", filled once the equipment list has loaded (the table re-renders after).
 let equipmentLabelById = new Map();
@@ -104,12 +113,17 @@ const mapRow = (r) => ({
   otpVerificationPlanned: r.otp_verification_planned || "",
   delayMinutes: r.delay_minutes,
   equipmentsNeeded: r.equipments_needed || [],
+  enquiryType: r.enquiry_type || "",
+  svEngineer: r.sv_engineer || "",
+  vcEngineer: r.vc_engineer || "",
 });
 
 function cellText(key, t) {
   if (DATE_KEYS.includes(key)) return t[key] ? formatDisplayDate(t[key]) : "";
   if (key === "quotationNo") return cleanQuotationNo(t.quotationNo);
   if (key === "equipmentsNeeded") return formatEquipments(t.equipmentsNeeded, equipmentLabelById);
+  if (key === "otpVerificationPlanned") return t.otpVerificationPlanned ? new Date(t.otpVerificationPlanned).toLocaleString("en-IN") : "";
+  if (key === "delay") return t.delayMinutes === null || t.delayMinutes === undefined ? "" : `${t.delayMinutes} min`;
   if (key === "amount") return `₹${t.amount || "0"}`;
   return t[key] || "";
 }
@@ -138,7 +152,11 @@ function renderCell(key, t) {
   const text = cellText(key, t) || "-";
   return (
     <td key={key} className={`px-3.5 py-2 text-xs text-foreground align-middle ${key === "clientName" ? "font-semibold" : ""}`}>
-      <div className="max-w-[240px] truncate" title={text}>{text}</div>
+      {key === "destinationInput" ? (
+        <div className="w-[200px] line-clamp-2 break-words" title={text}>{text}</div>
+      ) : (
+        <div className="max-w-[240px] truncate" title={text}>{text}</div>
+      )}
     </td>
   );
 }
@@ -205,7 +223,7 @@ export default function TADA() {
   // Warn (never block) when another ticket already holds a chosen item in this travel window.
   useEffect(() => {
     const ids = formData.equipmentsNeeded || [];
-    if (!showTADAModal || ids.length === 0 || !formData.travelDate) {
+    if (!showTADAModal || !needsEquipmentsFor(selectedTicket?.enquiryType) || ids.length === 0 || !formData.travelDate) {
       setEquipmentConflicts([]);
       return;
     }
@@ -216,7 +234,7 @@ export default function TADA() {
     return () => {
       cancelled = true;
     };
-  }, [showTADAModal, formData.equipmentsNeeded, formData.travelDate, formData.returnDate, selectedTicket?.id]);
+  }, [showTADAModal, formData.equipmentsNeeded, formData.travelDate, formData.returnDate, selectedTicket?.id, selectedTicket?.enquiryType]);
 
   // Engineers only see tickets assigned to them; admins see everything and may cancel a ticket.
   const isEngineer = user?.role === "ENGINEER";
@@ -290,7 +308,7 @@ export default function TADA() {
   const handleSubmit = async (e) => {
     e.preventDefault();
 
-    if (!formData.equipmentsNeeded?.length) {
+    if (needsEquipmentsFor(selectedTicket?.enquiryType) && !formData.equipmentsNeeded?.length) {
       toast.error("Please select at least one Equipment");
       return;
     }
@@ -329,7 +347,7 @@ export default function TADA() {
         amount: formData.amount || null,
         expected_completion_date: formData.expectedCompletionDate || null,
         expected_completion_time: formData.expectedCompletionTime || null,
-        equipments_needed: formData.equipmentsNeeded,
+        equipments_needed: needsEquipmentsFor(selectedTicket?.enquiryType) ? formData.equipmentsNeeded : null,
         previous_advance_date: formData.previousAdvanceDate || null,
         previous_advance_settlement_date: formData.previousAdvanceSettlementDate || null,
         previous_advance_balance: formData.previousAdvanceBalance || null,
@@ -418,6 +436,42 @@ export default function TADA() {
     }
   };
 
+  // Reschedule: send the ticket back to Site Visit Plan for re-assignment (same as the Service Support TADA stage).
+  // Marks the active sss_site_visit row as rescheduled (kept as a log), which drops the ticket out of TADA pending.
+  const [rescheduleTicket, setRescheduleTicket] = useState(null);
+  const [rescheduleRemarks, setRescheduleRemarks] = useState("");
+  const [rescheduling, setRescheduling] = useState(false);
+
+  const handleRescheduleSubmit = async (e) => {
+    e.preventDefault();
+    if (!rescheduleTicket) return;
+    setRescheduling(true);
+    try {
+      const { error } = await supabase
+        .from("sss_site_visit")
+        .update({
+          rescheduled_at: new Date().toISOString(),
+          rescheduled_by: user?.name || null,
+          reschedule_remarks: rescheduleRemarks || null,
+        })
+        .eq("ticket_id", rescheduleTicket.ticketId)
+        .is("rescheduled_at", null);
+      if (error) throw error;
+
+      await supabase.from("sss_tickets").update({ current_stage: "Site Visit Plan" }).eq("uuid", rescheduleTicket.id);
+
+      toast.success(`${rescheduleTicket.ticketId} sent back to Site Visit Plan for re-assignment.`);
+      setRescheduleTicket(null);
+      setRescheduleRemarks("");
+      list.reload();
+    } catch (error) {
+      console.error("Error rescheduling ticket:", error);
+      toast.error(error.message || "Failed to reschedule ticket");
+    } finally {
+      setRescheduling(false);
+    }
+  };
+
   const isPending = list.tab === "pending";
   const rows = useMemo(() => list.rows.map(mapRow), [list.rows]);
   const headers = [...(isPending ? [{ label: "Action", className: "w-24" }] : []), ...list.activeColumns.map((c) => c.label)];
@@ -490,6 +544,15 @@ export default function TADA() {
                     <Car size={13} aria-hidden="true" />
                     TADA
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => { setRescheduleRemarks(""); setRescheduleTicket(ticket); }}
+                    data-testid={`button-reschedule-${ticket.ticketId}`}
+                    title="Send this ticket back to Site Visit Plan for re-assignment"
+                    className="ml-2 inline-flex h-8 items-center rounded-md border border-input bg-card px-3 text-xs font-semibold text-foreground transition-colors hover:bg-accent"
+                  >
+                    Reschedule
+                  </button>
                 </td>
               )}
               {list.activeColumns.map((c) => renderCell(c.key, ticket))}
@@ -510,6 +573,15 @@ export default function TADA() {
                   >
                     <Car size={13} aria-hidden="true" />
                     TADA
+                  </button>
+                )}
+                {isPending && (
+                  <button
+                    type="button"
+                    onClick={() => { setRescheduleRemarks(""); setRescheduleTicket(ticket); }}
+                    className="inline-flex h-8 items-center rounded-md border border-input bg-card px-3 font-semibold text-foreground"
+                  >
+                    Reschedule
                   </button>
                 )}
               </div>
@@ -533,6 +605,41 @@ export default function TADA() {
           )}
         />
       </div>
+
+      {/* Reschedule Modal */}
+      <Modal
+        isOpen={!!rescheduleTicket}
+        onClose={() => setRescheduleTicket(null)}
+        title="Reschedule Site Visit"
+        size="md"
+      >
+        <form onSubmit={handleRescheduleSubmit} className="space-y-4 p-1">
+          <p className="text-sm text-gray-600">
+            Ticket <span className="font-semibold">{rescheduleTicket?.ticketId}</span> will be sent back to{" "}
+            <span className="font-semibold">Site Visit Plan</span>'s Pending tab for re-assignment to a different engineer.
+            The current assignment (<span className="font-semibold">{rescheduleTicket?.engineerAssign || "N/A"}</span>) will be kept as a log and tagged "Rescheduled" there.
+          </p>
+          <div className="space-y-1">
+            <Label htmlFor="tada-rescheduleRemarks" className="text-gray-600 font-medium">Reason (optional)</Label>
+            <Textarea
+              id="tada-rescheduleRemarks"
+              rows={3}
+              value={rescheduleRemarks}
+              onChange={(e) => setRescheduleRemarks(e.target.value)}
+              placeholder="Why is this being rescheduled?"
+            />
+          </div>
+          <div className="flex justify-end gap-3 pt-2">
+            <Button type="button" variant="outline" onClick={() => setRescheduleTicket(null)} disabled={rescheduling}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={rescheduling}>
+              {rescheduling && <Loader2Icon className="mr-2 h-4 w-4 animate-spin" />}
+              Confirm Reschedule
+            </Button>
+          </div>
+        </form>
+      </Modal>
 
       {/* TADA Modal */}
       <Modal
@@ -720,6 +827,7 @@ export default function TADA() {
                     />
                   </div>
 
+                  {needsEquipmentsFor(selectedTicket?.enquiryType) && (
                   <div className="md:col-span-2 space-y-1">
                     <Label className="text-gray-600 font-medium">
                       Equipments Needed *
@@ -731,6 +839,7 @@ export default function TADA() {
                       conflicts={equipmentConflicts}
                     />
                   </div>
+                  )}
 
                   <div className="md:col-span-2 space-y-1">
                     <Label className="text-gray-600 font-medium">
