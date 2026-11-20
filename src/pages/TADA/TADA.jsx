@@ -313,6 +313,24 @@ export default function TADA() {
       return;
     }
 
+    // Everything the Senior Approval email needs. The email function rejects a send when any of these is blank,
+    // so block the submit here instead of saving a TADA whose approval email can never go out.
+    const blank = (v) => v === "" || v === undefined || v === null || String(v).trim() === "";
+    const missing = [
+      [formData.travelDate, "Travel Date"],
+      [formData.returnDate, "Return Date"],
+      [formData.destination, "Destination"],
+      [formData.purposeOfTravel, "Purpose of Travel"],
+      [formData.amount, "Amount"],
+      [formData.machineName, "Machine Name"],
+      [formData.siteName || selectedTicket?.siteAddress, "Site Name"],
+      [formData.engineerAssign || selectedTicket?.engineerAssign, "Engineer Assign"],
+    ].filter(([v]) => blank(v)).map(([, label]) => label);
+    if (missing.length > 0) {
+      toast.error(`Please fill / set: ${missing.join(", ")}`);
+      return;
+    }
+
     if (
       !formData.previousAdvanceDate ||
       !formData.previousAdvanceSettlementDate ||
@@ -760,6 +778,7 @@ export default function TADA() {
                       onChange={(e) =>
                         handleInputChange("returnDate", e.target.value)
                       }
+                      required
                       data-testid="input-return-date"
                       className="border-gray-300 rounded-lg py-2 px-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                     />
@@ -775,6 +794,7 @@ export default function TADA() {
                       onChange={(e) =>
                         handleInputChange("destination", e.target.value)
                       }
+                      required
                       data-testid="input-destination"
                       className="border-gray-300 rounded-lg py-2 px-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                     />
@@ -790,6 +810,7 @@ export default function TADA() {
                       onChange={(e) =>
                         handleInputChange("purposeOfTravel", e.target.value)
                       }
+                      required
                       data-testid="input-purpose"
                       className="border-gray-300 rounded-lg py-2 px-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                     />
@@ -852,6 +873,7 @@ export default function TADA() {
                       onChange={(e) =>
                         handleInputChange("amount", e.target.value)
                       }
+                      required
                       data-testid="input-amount"
                       className="border-gray-300 rounded-lg py-2 px-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                     />
