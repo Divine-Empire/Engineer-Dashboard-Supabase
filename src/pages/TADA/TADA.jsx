@@ -29,7 +29,7 @@ const ORDER = {
   history: [{ column: "created_at", ascending: false }],
 };
 const COLUMNS = [
-  { key: "timeStemp", label: "Date", defaultVisible: true },
+  { key: "tadaPlanned", label: "Planned Date", defaultVisible: true },
   { key: "ticketId", label: "Ticket ID", defaultVisible: true },
   { key: "sourceOfEnquiry", label: "Source of enquiry", defaultVisible: false },
   { key: "callType", label: "Call type", defaultVisible: false },
@@ -61,7 +61,7 @@ const COLUMNS = [
   { key: "delay", label: "Delay", defaultVisible: true, tabs: ["history"] },
   { key: "quotationPdfLink", label: "Quotation PDF", defaultVisible: true },
 ];
-const DATE_KEYS = ["timeStemp", "dateOfVisit", "travelDate", "returnDate"];
+const DATE_KEYS = ["tadaPlanned", "timeStemp", "dateOfVisit", "travelDate", "returnDate"];
 const WIDE_KEYS = ["mentionIssue", "gstAddress", "siteAddress", "purposeOfTravel", "destinationInput", "companyName", "equipmentsNeeded"];
 
 // Equipments are needed only for NABL / NON-NABL tickets (matches the SSS TADA form and DB trigger, migration 0071).
@@ -80,6 +80,7 @@ const cleanQuotationNo = (q) => (q ? String(q).replace(/^(Quotation|Quo|QUO|Quo\
 const mapRow = (r) => ({
   id: r.id,
   timeStemp: r.created_at || "",
+  tadaPlanned: r.tada_planned || "",
   ticketId: r.ticket_id || "",
   sourceOfEnquiry: r.source_of_enquiry || "",
   callType: r.call_type || "",
@@ -583,7 +584,7 @@ export default function TADA() {
               <div className="flex items-start justify-between gap-2">
                 <div>
                   <span className="rounded bg-secondary px-1.5 py-0.5 font-mono font-semibold">{ticket.ticketId}</span>
-                  <p className="mt-1 text-muted-foreground">{formatDisplayDate(ticket.timeStemp)}</p>
+                  <p className="mt-1 text-muted-foreground">{formatDisplayDate(ticket.tadaPlanned)}</p>
                 </div>
                 {isPending && (
                   <button
@@ -607,7 +608,7 @@ export default function TADA() {
               </div>
               <dl className="grid grid-cols-2 gap-x-3 gap-y-2 border-t pt-2">
                 {list.activeColumns
-                  .filter((c) => !["ticketId", "timeStemp"].includes(c.key) && cellText(c.key, ticket))
+                  .filter((c) => !["ticketId", "tadaPlanned"].includes(c.key) && cellText(c.key, ticket))
                   .map((c) => (
                     <div key={c.key} className={WIDE_KEYS.includes(c.key) ? "col-span-2" : ""}>
                       <dt className="text-muted-foreground">{c.label}</dt>
